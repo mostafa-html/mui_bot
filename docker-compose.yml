@@ -1,0 +1,116 @@
+volumes:
+  storage-data:
+  redis-data:
+  postgres-data:
+  pgadmin-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpnbot -d vpnbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ─── pgAdmin (database management UI) ───────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: iFYojXT0NPQtOnERpeFG
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─── One‑time database initialisation ──────────────────────────────
+  db-init:
+    build: .
+    command: python -c "import database; database.init_database()"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - storage-data:/app/storage
+    restart: "no"   # run once and exit
+
+  # ─── Main bot ────────────────────────────────────────────────────────
+  bot:
+    build: .
+    command: python bot.py
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      - SKIP_DB_INIT=true
+      - PYTHONUNBUFFERED=1          # ensures logs are printed immediately
+    env_file:
+      - .env
+    volumes:
+      - storage-data:/app/storage
+    restart: unless-stopped
+    # healthcheck removed – not needed for core functionality
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+  # ─── Celery worker ──────────────────────────────────────────────────
+  celery-worker:
+    build: .
+    command: celery -A tasks worker --loglevel=info --concurrency=1
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      - SKIP_DB_INIT=true
+    env_file:
+      - .env
+    volumes:
+      - storage-data:/app/storage
+    restart: unless-stopped
+
+  # ─── Celery beat ────────────────────────────────────────────────────
+  celery-beat:
+    build: .
+    command: celery -A tasks beat --loglevel=info
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      - SKIP_DB_INIT=true
+    env_file:
+      - .env
+    volumes:
+      - storage-data:/app/storage
+    restart: unless-stopped
