@@ -17,6 +17,7 @@ load_dotenv()
 
 # Import shared utilities to avoid duplication
 from src.utils.formatting import format_size
+from src.services.reconcile import compute_reconcile, to_plan
 
 REDIS_URL = os.getenv('REDIS_URL')
 
@@ -799,7 +800,12 @@ def provision_new(self, invoice_id: int, inbound_ids: list):
                 traffic_gb = plan.traffic_gb
                 duration_days = plan.duration_days
                 original_name = invoice.client_name
-                final_email = f"{original_name}_{invoice_id}"
+                # Idempotent: a redo of a stuck invoice reads the already-updated
+                # client_name (line ~824 writes final_email back). Appending the
+                # suffix again would build Alikargar_528_528_... and create a fresh
+                # orphan panel client on every redo. Only add the suffix once.
+                suffix = f"_{invoice_id}"
+                final_email = original_name if original_name.endswith(suffix) else f"{original_name}{suffix}"
 
             # XUI operations
             xui = XUIClient()
@@ -821,6 +827,7 @@ def provision_new(self, invoice_id: int, inbound_ids: list):
                 invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
                 if invoice:
                     invoice.status = "COMPLETE"
+                    invoice.client_name = final_email  # Update to the actual email used on panel
                     db.commit()
 
             await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"], "✅ <b>سرویس شما با موفقیت ایجاد شد!</b>\n\n🌟 لطفاً برای مشاهده لینک اتصال و جزئیات، به منوی <b>📦 مدیریت سرویس‌های من</b> مراجعه کنید. 🙏")
@@ -1396,6 +1403,77 @@ def check_reseller_pack_expiry():
                             f"📅 انقضا در {days_left} روز (تا {pack.expiry_date.strftime('%Y-%m-%d')})\n\n"
                             f"💡 لطفاً قبل از انقضا از ترافیک باقیمانده استفاده کنید.")
                     await notify_user(reseller_id, text)
-            
+
             db.commit()
+    run_async(_run())
+
+
+async def notify_user_with_buttons(tg_id: int, text: str, inline_keyboard: list):
+    """Send a DM with an inline keyboard. ``inline_keyboard`` is Telegram's raw
+    layout — a list of button-rows, each a list of {"text","callback_data"} dicts.
+    Workers have no aiogram Bot, so this talks to the Telegram HTTP API directly
+    (mirrors ``notify_user``)."""
+    bot_token = os.getenv('BOT_TOKEN')
+    if not bot_token:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": tg_id, "text": text, "parse_mode": "HTML"}
+    if inline_keyboard:
+        payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json=payload)
+
+
+# ----- Reconcile invisible services: repair client_name to the real panel email -----
+@celery_app.task
+def reconcile_client_names(admin_id: int, user_filter: str = None):
+    """Full-panel dry-run scan for invoices whose ``client_name`` doesn't match the
+    real panel email — the mismatch is what makes a service invisible in
+    "My Services". Scope is name repair only (no orphan deletion).
+
+    Runs on the worker because a full scan touches every panel group and probes
+    the panel for missing NEW clients, so it takes several minutes (worker
+    concurrency=1). It writes NOTHING: it stashes the proposed plan in Redis under
+    ``reconcile_plan:{admin_id}`` (TTL 1h) and DMs the admin a summary with a
+    tap-to-apply button. Applying is fast (DB writes + cache clear) and is done
+    inline by the bot's ``reconcile_apply`` handler off the stashed plan, so
+    tapping the button never triggers a second multi-minute scan.
+    """
+    async def _run():
+        xui = XUIClient()
+        try:
+            result = await compute_reconcile(xui, user_filter)
+        finally:
+            await xui.close()
+
+        fixes = result["fixes"]
+        plan = to_plan(fixes)
+        total = len(result["records"])
+
+        # Stash the plan so the apply button doesn't need to re-scan the panel.
+        r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            if plan:
+                await r.set(f"reconcile_plan:{admin_id}", json.dumps(plan), ex=3600)
+            else:
+                await r.delete(f"reconcile_plan:{admin_id}")
+        finally:
+            await r.aclose()
+
+        scope = f" (کاربر <code>{user_filter}</code>)" if user_filter else ""
+        header = (
+            f"🔧 <b>بازسازی نام سرویس‌ها</b>{scope}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🔎 بررسی‌شده: <b>{total}</b> فاکتور در <b>{result['groups']}</b> گروه\n"
+            f"🛠 قابل تعمیر: <b>{len(fixes)}</b>\n"
+            f"✅ از قبل درست: <b>{len(result['skipped'])}</b>\n"
+            f"❓ مبهم (بررسی دستی): <b>{len(result['ambiguous'])}</b>\n"
+            f"🚫 روی پنل نیست: <b>{len(result['not_found'])}</b>"
+        )
+        if plan:
+            text = header + f"\n\n👇 برای اعمال <b>{len(plan)}</b> تعمیر، دکمه زیر را بزنید."
+            kb = [[{"text": f"✅ اعمال {len(plan)} تعمیر", "callback_data": "reconcile_apply"}]]
+            await notify_user_with_buttons(admin_id, text, kb)
+        else:
+            await notify_user(admin_id, header + "\n\n✅ موردی برای تعمیر یافت نشد.")
     run_async(_run())

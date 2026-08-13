@@ -83,6 +83,10 @@ def get_admin_menu():
                 InlineKeyboardButton(text="🔄 بازبینی فاکتورها", callback_data="admin_retry_invoices"),
             ],
             [
+                InlineKeyboardButton(text="🔧 تعمیر سرویس‌های نامرئی", callback_data="admin_reconcile_names"),
+                InlineKeyboardButton(text="👤 تعمیر یک کاربر", callback_data="admin_reconcile_user"),
+            ],
+            [
                 InlineKeyboardButton(text="📊 مصرف روزانه پنل", callback_data="admin_panel_traffic"),
                 InlineKeyboardButton(text="🔄 جمع‌آوری دستی", callback_data="admin_force_traffic")
             ],

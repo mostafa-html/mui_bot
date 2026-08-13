@@ -39,6 +39,7 @@ from src.utils.keyboard import (
 )
 from src.services.reseller import is_reseller, get_reseller_balance, reserve_reseller_allowance, reseller_owns_email, user_owns_email, GB
 from src.services.coupon import validate_coupon, calculate_discount
+from src.services.reconcile import compute_reconcile, apply_plan, to_plan
 
 # Environment variables are validated in src.config
 REQ_CHANNEL_ID = REQUIRED_CHANNEL_ID
@@ -77,6 +78,7 @@ class AdminFlow(StatesGroup):
     wait_for_card = State()
     wait_for_sub_link = State()
     wait_for_manage_email = State()
+    wait_for_reconcile_user = State()         # per-user "repair invisible services" quick-fix
     wait_for_support_account = State()
     # Coupon
     wait_for_coupon_code = State()
@@ -1153,15 +1155,59 @@ async def reseller_list_cb(callback: types.CallbackQuery):
                 [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="reseller_panel")]
             ]), parse_mode="HTML"
         )
+    
+    # Fetch live status for each service to show active/expired badges (same as my_plans_content)
+    xui = get_xui_client()
+    statuses = {}
+    try:
+        fetch_tasks = [xui.get_client_full(email) for email in emails]
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        
+        for email, result in zip(emails, results):
+            if isinstance(result, Exception) or result is None or 'client' not in result:
+                statuses[email] = 'unknown'
+            else:
+                client = result['client']
+                expiry = client.get('expiryTime', 0)
+                now_ms = int(time.time() * 1000)
+                if expiry > 0 and now_ms > expiry:
+                    statuses[email] = 'expired'
+                elif not client.get('enable', True):
+                    statuses[email] = 'disabled'
+                else:
+                    statuses[email] = 'active'
+    except Exception:
+        # If fetching fails, default all to unknown
+        for email in emails:
+            statuses[email] = 'unknown'
+    
+    active_count = sum(1 for s in statuses.values() if s == 'active')
+    expired_count = sum(1 for s in statuses.values() if s == 'expired')
+    disabled_count = sum(1 for s in statuses.values() if s == 'disabled')
+    unknown_count = sum(1 for s in statuses.values() if s == 'unknown')
+    
     text = (
         f"📦 <b>سرویس‌های نمایندگی</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 فعال: {active_count} | 🔴 منقضی/غیرفعال: {expired_count + disabled_count} | ❓ نامشخص: {unknown_count}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"نمایش {len(emails)} سرویس اخیر (حداکثر ۵۰).\n\n"
         f"👇 برای جزئیات و مدیریت، سرویس را انتخاب کنید:"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔌 {email}", callback_data=f"stat_{email}")] for email in emails
-    ] + [[InlineKeyboardButton(text="⬅️ بازگشت", callback_data="reseller_panel")]])
+    
+    kb_buttons = []
+    for email in emails:
+        status = statuses.get(email, 'unknown')
+        if status == 'active':
+            emoji = '🟢'
+        elif status in ('expired', 'disabled'):
+            emoji = '🔴'
+        else:
+            emoji = '❓'
+        kb_buttons.append([InlineKeyboardButton(text=f"{emoji} {email}", callback_data=f"stat_{email}")])
+    
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data="reseller_panel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 # ----- Create new reseller service -----
@@ -1744,22 +1790,25 @@ async def my_plans_content(user_id: int):
         try:
             # Fetch all clients from panel to check existence
             panel_emails_set = set(await xui.get_group_emails(tg_id))
-            
-            # Verify each DB email exists on panel (even if disabled)
-            emails = []
-            for email in db_emails:
-                if email in panel_emails_set:
-                    emails.append(email)
-                else:
-                    # Double-check by trying to get client full info
-                    # This catches cases where group-email API might not return all emails
-                    try:
-                        client_info = await xui.get_client_full(email)
-                        if client_info is not None and 'client' in client_info:
-                            emails.append(email)
-                            panel_emails_set.add(email)
-                    except Exception:
-                        pass  # Email doesn't exist on panel, skip it
+
+            # Emails in the group listing are confirmed for free. The rest may
+            # still exist on the panel but not be group-assigned, so probe them —
+            # in PARALLEL. This used to be a serial loop where each missing/deleted
+            # email cost ~3.5s of retry backoff (the reason "My Services" was slow
+            # for users with stale services). Combined with the not-found fast-path
+            # in XUIClient, the whole check is now ~one round-trip.
+            confirmed = {e for e in db_emails if e in panel_emails_set}
+            missing = [e for e in db_emails if e not in panel_emails_set]
+            if missing:
+                probes = await asyncio.gather(
+                    *[xui.get_client_full(e) for e in missing],
+                    return_exceptions=True,
+                )
+                for e, info in zip(missing, probes):
+                    if not isinstance(info, Exception) and info is not None and 'client' in info:
+                        confirmed.add(e)
+            # Preserve the original DB order for display.
+            emails = [e for e in db_emails if e in confirmed]
         except Exception:
             emails = db_emails
 
@@ -2517,6 +2566,113 @@ async def adm_clearip_user(callback: types.CallbackQuery):
     xui = XUIClient()
     await xui.clear_client_ips(email)
     await callback.answer("✅ قفل آی‌پی‌های کاربر شکسته شد.", show_alert=True)
+
+# ==============================================================================
+# RECONCILE INVISIBLE SERVICES (repair client_name -> real panel email)
+# ==============================================================================
+# Some services became invisible in "My Services" because the invoice's
+# client_name was stored as the bare typed name instead of the real panel email
+# ({name}_{invoice_id}). These handlers repair that mismatch (name repair only).
+
+@dp.callback_query(F.data == "admin_reconcile_names")
+async def admin_reconcile_names(callback: types.CallbackQuery):
+    """Kick off a full-panel scan on the worker. It's a multi-minute job
+    (worker concurrency=1), so we dispatch to Celery and let it DM the admin a
+    dry-run summary with a tap-to-apply button — never block the bot loop."""
+    if callback.from_user.id not in get_admin_ids():
+        return await callback.answer("⛔ دسترسی غیرمجاز", show_alert=True)
+    try:
+        tasks.reconcile_client_names.delay(callback.from_user.id)
+        await callback.message.edit_text(
+            "🔧 <b>بازسازی نام سرویس‌ها آغاز شد</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "کل پنل در حال بررسی است؛ این کار چند دقیقه طول می‌کشد.\n"
+            "گزارش به‌همراه دکمهٔ «اعمال» به‌صورت پیام برای شما ارسال می‌شود.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ بازگشت به پنل", callback_data="admin_panel")]
+            ]),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ <b>خطا در صدور دستور:</b>\n<code>{str(e)[:200]}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_panel")]]),
+            parse_mode="HTML"
+        )
+
+@dp.callback_query(F.data == "reconcile_apply")
+async def reconcile_apply(callback: types.CallbackQuery):
+    """Apply the plan the full-scan task stashed in Redis. Applying is just DB
+    writes + cache clears (no panel calls), so it runs inline here — no second
+    multi-minute scan."""
+    if callback.from_user.id not in get_admin_ids():
+        return await callback.answer("⛔ دسترسی غیرمجاز", show_alert=True)
+    key = f"reconcile_plan:{callback.from_user.id}"
+    raw = await redis_client.get(key)
+    if not raw:
+        return await callback.answer("⛔ برنامهٔ تعمیر منقضی شده است. دوباره اسکن کنید.", show_alert=True)
+    try:
+        plan = json.loads(raw)
+    except Exception:
+        plan = []
+    await callback.answer("در حال اعمال تغییرات...")
+    n = await apply_plan(plan)
+    await redis_client.delete(key)
+    await callback.message.edit_text(
+        "✅ <b>تعمیر انجام شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🛠 <b>{n}</b> سرویس بازسازی شد و اکنون در «سرویس‌های من» نمایش داده می‌شود.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ بازگشت به پنل", callback_data="admin_panel")]
+        ]),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "admin_reconcile_user")
+async def admin_reconcile_user_ask(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids():
+        return await callback.answer("⛔ دسترسی غیرمجاز", show_alert=True)
+    await callback.message.edit_text(
+        "🔧 <b>تعمیر سرویس‌های یک کاربر</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "آی‌دی عددی تلگرام کاربر (یا آی‌دی نمایندگی) را ارسال کنید:",
+        reply_markup=get_cancel_kb(), parse_mode="HTML"
+    )
+    await state.set_state(AdminFlow.wait_for_reconcile_user)
+
+@dp.message(AdminFlow.wait_for_reconcile_user)
+async def admin_reconcile_user_run(message: types.Message, state: FSMContext):
+    """Repair one user's invisible services. Scoped to a single panel group, so
+    it's fast enough to compute inline (unlike the full scan)."""
+    gid = (message.text or "").strip()
+    if not gid.isdigit():
+        return await message.answer("❌ لطفاً یک آی‌دی عددی معتبر ارسال کنید.", reply_markup=get_cancel_kb())
+    await state.clear()
+    status = await message.answer("⏳ در حال بررسی سرویس‌های کاربر...")
+    result = await compute_reconcile(get_xui_client(), gid)
+    fixes = result["fixes"]
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ بازگشت به پنل", callback_data="admin_panel")]
+    ])
+    if not fixes:
+        return await status.edit_text(
+            "🔧 <b>تعمیر سرویس‌های کاربر</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"👤 کاربر: <code>{gid}</code>\n"
+            f"🔎 بررسی‌شده: <b>{len(result['records'])}</b> فاکتور\n"
+            f"❓ مبهم: <b>{len(result['ambiguous'])}</b> | 🚫 روی پنل نیست: <b>{len(result['not_found'])}</b>\n\n"
+            "✅ موردی برای تعمیر یافت نشد.",
+            reply_markup=back_kb, parse_mode="HTML"
+        )
+    n = await apply_plan(to_plan(fixes))
+    await status.edit_text(
+        "✅ <b>تعمیر انجام شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 کاربر: <code>{gid}</code>\n"
+        f"🛠 <b>{n}</b> سرویس بازسازی شد و اکنون در «سرویس‌های من» نمایش داده می‌شود.\n"
+        f"❓ مبهم: <b>{len(result['ambiguous'])}</b> | 🚫 روی پنل نیست: <b>{len(result['not_found'])}</b>",
+        reply_markup=back_kb, parse_mode="HTML"
+    )
 
 # ==============================================================================
 # INVOICE APPROVAL

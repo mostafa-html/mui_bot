@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+Migration Script: Fix Mismatched Client Names in Invoices
+---------------------------------------------------------
+This script fixes invoices where the stored client_name does not match
+the actual email on the X-UI panel (caused by the '_invoiceId' suffix bug).
+
+SAFETY FEATURES:
+1. Creates a full database backup before making changes
+2. Dry-run mode: Shows what WILL change without actually changing it
+3. Detailed logging of every action
+4. Only updates invoices that are COMPLETED and have a mismatch
+
+HOW TO USE:
+1. First, run in DRY-RUN mode to see what will be fixed:
+   python fix_client_names.py --dry-run
+
+2. If the output looks correct, run for real:
+   python fix_client_names.py
+
+3. To force re-checking even if previously fixed:
+   python fix_client_names.py --force
+"""
+
+import os
+import sys
+import sqlite3
+import shutil
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+# Import bot config to get DB path and X-UI settings
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from config import DB_PATH, XUI_HOST, XUI_USERNAME, XUI_PASSWORD, XUI_PORT
+except ImportError:
+    print("❌ Error: Could not import config.py. Make sure you're running this from the bot directory.")
+    sys.exit(1)
+
+# Simple HTTP client (no external dependencies like requests needed if you prefer,
+# but we'll use requests since the bot already uses it)
+try:
+    import requests
+except ImportError:
+    print("❌ Error: 'requests' library is required. Install with: pip install requests")
+    sys.exit(1)
+
+
+def get_xui_session():
+    """Login to X-UI and return session object."""
+    session = requests.Session()
+    login_url = f"{XUI_HOST}/login"
+    payload = {
+        "username": XUI_USERNAME,
+        "password": XUI_PASSWORD
+    }
+
+    try:
+        resp = session.post(login_url, data=payload, timeout=10)
+        if resp.status_code == 200 and resp.json().get("success"):
+            return session
+        else:
+            print(f"❌ X-UI Login failed: {resp.text}")
+            return None
+    except Exception as e:
+        print(f"❌ Error connecting to X-UI: {e}")
+        return None
+
+def get_all_clients_from_panel(session):
+    """Fetch all clients from X-UI panel."""
+    if not session:
+        return []
+
+    url = f"{XUI_HOST}/xui/inbound/list"
+    try:
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                clients = []
+                for inbound in data.get("obj", []):
+                    settings = inbound.get("settings", "")
+                    if isinstance(settings, str):
+                        import json
+                        try:
+                            settings = json.loads(settings)
+                        except:
+                            continue
+
+                    # Extract clients from both VMess and VLESS settings
+                    client_list = settings.get("clients", [])
+                    for c in client_list:
+                        email = c.get("email", "")
+                        if email:
+                            clients.append(email)
+                return clients
+        print(f"⚠️ Failed to fetch clients from panel: {resp.text}")
+        return []
+    except Exception as e:
+        print(f"❌ Error fetching clients: {e}")
+        return []
+
+def backup_database(db_path):
+    """Create a timestamped backup of the database."""
+    backup_path = f"{db_path}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        shutil.copy2(db_path, backup_path)
+        print(f"✅ Database backup created: {backup_path}")
+        return backup_path
+    except Exception as e:
+        print(f"❌ Failed to create backup: {e}")
+        return None
+
+def main():
+    parser = argparse.ArgumentParser(description="Fix mismatched client names in invoices.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be changed without applying changes")
+    parser.add_argument("--force", action="store_true", help="Re-check and update even if already processed")
+    args = parser.parse_args()
+
+    if not os.path.exists(DB_PATH):
+        print(f"❌ Database not found at: {DB_PATH}")
+        sys.exit(1)
+
+    print("🔍 Starting Client Name Migration...")
+    print(f"📂 Database: {DB_PATH}")
+
+    # Step 1: Backup
+    if not args.dry_run:
+        backup_path = backup_database(DB_PATH)
+        if not backup_path:
+            print("❌ Aborting due to backup failure.")
+            sys.exit(1)
+    else:
+        print("ℹ️  Dry-run mode: No backup will be created (no changes made).")
+
+    # Step 2: Connect to DB
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Step 3: Get all COMPLETED invoices with client_name
+    cursor.execute("""
+        SELECT id, user_id, client_name, status
+        FROM invoices
+        WHERE status = 'COMPLETED' AND client_name IS NOT NULL
+    """)
+    invoices = cursor.fetchall()
+
+    print(f"📄 Found {len(invoices)} completed invoices with client names.")
+
+    # Step 4: Get actual emails from X-UI Panel
+    print("📡 Fetching current clients from X-UI panel...")
+    session = get_xui_session()
+    panel_emails = set()
+    if session:
+        panel_emails = set(get_all_clients_from_panel(session))
+        print(f"✅ Found {len(panel_emails)} clients on X-UI panel.")
+    else:
+        print("❌ Could not connect to X-UI panel. Aborting.")
+        conn.close()
+        sys.exit(1)
+
+    fixed_count = 0
+    error_count = 0
+    no_change_count = 0
+
+    for invoice_id, user_id, db_client_name, status in invoices:
+        # Skip if already looks like it has the ID suffix (might be already fixed or old format)
+        # We only target simple names like "ali" that should be "ali_123"
+
+        # Strategy: The correct email on panel MUST exist in our panel_emails set.
+        # If db_client_name exists on panel, it might be correct (or user never had the suffix logic).
+        # If db_client_name does NOT exist, we look for a match starting with "db_client_name_"
+
+        if db_client_name in panel_emails:
+            # Case A: The name in DB exists on panel.
+            # This could mean:
+            # 1. It was an old invoice before the bug.
+            # 2. It was already fixed.
+            # 3. The user bought a plan where the logic didn't apply (unlikely given the bug report).
+            # We assume it's correct unless --force is used to double check uniqueness.
+            if not args.force:
+                no_change_count += 1
+                continue
+
+        # Case B: The name in DB does NOT exist on panel.
+        # We suspect the real email is "{db_client_name}_{invoice_id}"
+        potential_email = f"{db_client_name}_{invoice_id}"
+
+        if potential_email in panel_emails:
+            print(f"🔧 Mismatch found: Invoice #{invoice_id}")
+            print(f"   DB Name: '{db_client_name}' (Not on panel)")
+            print(f"   Panel Name: '{potential_email}' (Exists on panel)")
+
+            if args.dry_run:
+                print(f"   ⏭️  [DRY-RUN] Would update DB to: '{potential_email}'")
+                fixed_count += 1
+            else:
+                # Perform Update
+                try:
+                    cursor.execute("""
+                        UPDATE invoices
+                        SET client_name = ?
+                        WHERE id = ?
+                    """, (potential_email, invoice_id))
+                    conn.commit()
+                    print(f"   ✅ Updated DB to: '{potential_email}'")
+                    fixed_count += 1
+                except Exception as e:
+                    print(f"   ❌ Error updating invoice {invoice_id}: {e}")
+                    error_count += 1
+        else:
+            # Case C: Neither the simple name nor the suffixed name exists on panel.
+            # This means the service might have been deleted from the panel,
+            # or the naming convention is different.
+            print(f"⚠️  Warning: Invoice #{invoice_id} ('{db_client_name}') has no matching client on panel.")
+            print(f"   Expected potential name: '{potential_email}'")
+            # We do NOT update this, as we don't know the correct email.
+            no_change_count += 1
+
+    conn.close()
+
+    print("\n" + "="*40)
+    print("📊 Migration Summary")
+    print("="*40)
+    if args.dry_run:
+        print(f"ℹ️  DRY-RUN MODE: No changes were saved.")
+        print(f"🔍 Invoices that WOULD be fixed: {fixed_count}")
+    else:
+        print(f"✅ Successfully fixed: {fixed_count} invoices")
+        print(f"⚠️  Skipped/No Action: {no_change_count} invoices")
+
+    if error_count > 0:
+        print(f"❌ Errors encountered: {error_count}")
+
+    print("="*40)
+    if not args.dry_run and fixed_count > 0:
+        print("💡 You can now restart your bot to apply changes.")
+
+if __name__ == "__main__":
+    main()

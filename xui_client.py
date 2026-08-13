@@ -3,6 +3,14 @@ import asyncio
 import httpx
 
 
+class ClientNotFoundError(Exception):
+    """Raised when the panel definitively reports a client does not exist
+    (HTTP 200 with success:false, msg "record not found"). This is a valid
+    negative answer, NOT a transient failure, so _request never retries it —
+    retrying wasted ~3.5s of backoff per missing-client lookup."""
+    pass
+
+
 # Global singleton instance for XUIClient
 _xui_client_instance = None
 
@@ -115,8 +123,17 @@ class XUIClient:
                 response.raise_for_status()
                 result = response.json()
                 if not result.get('success', True):
-                    raise Exception(f"Panel API error: {result.get('msg', 'unknown error')}")
+                    msg = result.get('msg', 'unknown error')
+                    # A definitive "record not found" is a valid negative answer
+                    # (HTTP 200, success:false), not a transient failure. Retrying
+                    # it just burns 3.5s of backoff per lookup — that is what made
+                    # "My Services" and the new-client pre-check slow. Fail fast.
+                    if "record not found" in msg.lower():
+                        raise ClientNotFoundError(msg)
+                    raise Exception(f"Panel API error: {msg}")
                 return result
+            except ClientNotFoundError:
+                raise  # definitive negative — never retry
             except Exception as e:
                 if attempt < max_retries:
                     # Exponential backoff
@@ -163,8 +180,10 @@ class XUIClient:
         try:
             res = await self._request("GET", f"/panel/api/clients/get/{email}")
             return res.get('obj', {})
+        except ClientNotFoundError:
+            return None
         except Exception as e:
-            # If the client is not found, return None so the caller can decide to create it.
+            # Backward-compat: some panel builds phrase the not-found differently.
             if "record not found" in str(e).lower():
                 return None
             raise
