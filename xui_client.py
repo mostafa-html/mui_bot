@@ -17,7 +17,7 @@ _xui_client_instance = None
 
 def get_xui_client() -> 'XUIClient':
     """Get or create the global singleton XUIClient instance.
-    
+
     This function returns a shared XUIClient instance that maintains
     a persistent HTTP session and authentication state across multiple
     requests, significantly improving performance by avoiding repeated
@@ -34,11 +34,11 @@ class XUIClient:
     3x-ui API client using session-based authentication (cookie + CSRF token).
 
     Auth flow:
-      1. GET /                 → captures session cookie
-      2. GET /csrf-token       → retrieves fresh CSRF token
-      3. POST /login           → authenticates with username/password + CSRF token
-      4. All subsequent requests reuse the session cookie;
-         state-changing methods (POST/PUT/DELETE) first refresh the CSRF token.
+    1. GET / → captures session cookie
+    2. GET /csrf-token → retrieves fresh CSRF token
+    3. POST /login → authenticates with username/password + CSRF token
+    4. All subsequent requests reuse the session cookie;
+       state-changing methods (POST/PUT/DELETE) first refresh the CSRF token.
     """
 
     def __init__(self):
@@ -135,6 +135,21 @@ class XUIClient:
             except ClientNotFoundError:
                 raise  # definitive negative — never retry
             except Exception as e:
+                # A 401/403 means the panel invalidated our session or CSRF token
+                # (e.g. panel restart, token rotation) *after* we last logged in.
+                # self._authenticated stays True across this exception, so without
+                # resetting it here, every retry would keep resending the same
+                # dead cookie and just 401 again until retries run out — which is
+                # exactly what made every service show up as "unknown" (❓) in
+                # "My Services" during a single stale-session event. Force the
+                # next attempt to log in again instead of trusting the cache.
+                is_auth_error = (
+                    isinstance(e, httpx.HTTPStatusError)
+                    and e.response.status_code in (401, 403)
+                )
+                if is_auth_error:
+                    self._authenticated = False
+                    self._csrf_token = None
                 if attempt < max_retries:
                     # Exponential backoff
                     wait_time = retry_delay * (2 ** attempt)
