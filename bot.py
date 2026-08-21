@@ -79,6 +79,7 @@ class AdminFlow(StatesGroup):
     wait_for_sub_link = State()
     wait_for_manage_email = State()
     wait_for_reconcile_user = State()         # per-user "repair invisible services" quick-fix
+    wait_for_sync_group = State()
     wait_for_support_account = State()
     # Coupon
     wait_for_coupon_code = State()
@@ -103,7 +104,6 @@ class AdminFlow(StatesGroup):
     wait_for_reseller_pack_days = State()     # after allowance, ask for expiry days
     wait_for_reseller_duration = State()
     wait_for_reseller_inbounds = State()
-    wait_for_reseller_inbounds_edit = State()  # for per-reseller inbound configuration
     # Broadcast
     wait_for_broadcast_message = State()
     # Dashboard
@@ -2674,6 +2674,201 @@ async def admin_reconcile_user_run(message: types.Message, state: FSMContext):
         reply_markup=back_kb, parse_mode="HTML"
     )
 
+# ============================================================================
+# IMPORT EXISTING PANEL GROUP CONFIGS
+# ============================================================================
+SYNC_PAGE_SIZE = 8
+SYNC_TTL = 900
+
+def _sync_key(admin_id: int, token: str) -> str:
+    return f"panel_sync:{admin_id}:{token}"
+
+def _sync_list_kb(token: str, items: list, selected: set, page: int = 0):
+    start = page * SYNC_PAGE_SIZE
+    page_items = items[start:start + SYNC_PAGE_SIZE]
+    rows = []
+    for idx, email in enumerate(page_items, start):
+        mark = "✅" if idx in selected else "⬜"
+        rows.append([InlineKeyboardButton(text=f"{mark} {email[:45]}", callback_data=f"sync_t:{token}:{idx}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"sync_p:{token}:{page - 1}"))
+    if start + SYNC_PAGE_SIZE < len(items):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"sync_p:{token}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.extend([
+        [InlineKeyboardButton(text="✅ انتخاب همه", callback_data=f"sync_all:{token}"), InlineKeyboardButton(text="🧹 پاک کردن", callback_data=f"sync_none:{token}")],
+        [InlineKeyboardButton(text="📥 ادامه و انتخاب پلن", callback_data=f"sync_go:{token}")],
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _render_sync_list(message, token: str, data: dict, page: int = 0):
+    items = data.get("items", [])
+    selected = set(data.get("selected", []))
+    await message.edit_text(
+        "📥 <b>همگام‌سازی گروه پنل</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 گروه/کاربر: <code>{data['group_id']}</code>\n"
+        f"🔎 موارد قابل همگام‌سازی: <b>{len(items)}</b>\n"
+        f"✅ انتخاب‌شده: <b>{len(selected)}</b>\n\n"
+        "فقط سرویس‌هایی را انتخاب کنید که باید در ربات ثبت شوند.",
+        reply_markup=_sync_list_kb(token, items, selected, page), parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "admin_sync_group")
+async def admin_sync_group_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids():
+        return await callback.answer("⛔ دسترسی غیرمجاز", show_alert=True)
+    await state.set_state(AdminFlow.wait_for_sync_group)
+    await callback.message.edit_text(
+        "📥 <b>همگام‌سازی گروه پنل</b>\n\nنام گروه همان شناسه عددی تلگرام کاربر است. ارسال کنید:",
+        reply_markup=get_cancel_kb(), parse_mode="HTML"
+    )
+
+@dp.message(AdminFlow.wait_for_sync_group)
+async def admin_sync_group_scan(message: types.Message, state: FSMContext):
+    if message.from_user.id not in get_admin_ids():
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        return await message.answer("❌ شناسه باید فقط عدد باشد.", reply_markup=get_cancel_kb())
+    group_id = int(raw)
+    if is_reseller(group_id):
+        return await message.answer("❌ همگام‌سازی نمایندگان در این نسخه پشتیبانی نمی‌شود.", reply_markup=get_cancel_kb())
+    try:
+        panel_emails = list(dict.fromkeys(await get_xui_client().get_group_emails(str(group_id))))
+    except Exception as exc:
+        return await message.answer(f"❌ دریافت گروه از پنل ناموفق بود: <code>{str(exc)[:180]}</code>", reply_markup=get_cancel_kb(), parse_mode="HTML")
+    with SessionLocal() as db:
+        known = {row[0] for row in db.query(Invoice.client_name).filter(Invoice.telegram_user_id == group_id, Invoice.client_name.isnot(None)).all()}
+        globally_owned = {row[0] for row in db.query(Invoice.client_name).filter(Invoice.client_name.in_(panel_emails), Invoice.telegram_user_id != group_id).all()}
+    items = [email for email in panel_emails if email not in known and email not in globally_owned]
+    conflicts = len([email for email in panel_emails if email in globally_owned])
+    if not items:
+        await state.clear()
+        return await message.answer(f"✅ مورد جدیدی برای گروه <code>{group_id}</code> پیدا نشد.\n⚠️ تعارض‌ها: {conflicts}", reply_markup=get_back_kb("admin_panel"), parse_mode="HTML")
+    token = secrets.token_urlsafe(6)
+    await redis_client.set(_sync_key(message.from_user.id, token), json.dumps({"group_id": group_id, "items": items, "selected": [], "plans": {}, "conflicts": conflicts}), ex=SYNC_TTL)
+    await state.clear()
+    status = await message.answer("⏳ در حال آماده‌سازی فهرست...")
+    await _render_sync_list(status, token, {"group_id": group_id, "items": items, "selected": [], "plans": {}, "conflicts": conflicts})
+
+async def _load_sync(admin_id, token):
+    raw = await redis_client.get(_sync_key(admin_id, token))
+    return json.loads(raw) if raw else None
+
+@dp.callback_query(F.data.startswith("sync_t:"))
+async def admin_sync_toggle(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    _, token, raw_idx, raw_page = callback.data.split(":")
+    data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    idx = int(raw_idx); selected = set(data["selected"])
+    if idx in selected: selected.remove(idx)
+    else: selected.add(idx)
+    data["selected"] = sorted(selected)
+    await redis_client.set(_sync_key(callback.from_user.id, token), json.dumps(data), ex=SYNC_TTL)
+    await callback.answer()
+    await _render_sync_list(callback.message, token, data, int(raw_page))
+
+@dp.callback_query(F.data.startswith("sync_all:"))
+async def admin_sync_select_all(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    token = callback.data.split(":", 1)[1]; data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    data["selected"] = list(range(len(data["items"])))
+    await redis_client.set(_sync_key(callback.from_user.id, token), json.dumps(data), ex=SYNC_TTL)
+    await callback.answer()
+    await _render_sync_list(callback.message, token, data)
+
+@dp.callback_query(F.data.startswith("sync_none:"))
+async def admin_sync_select_none(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    token = callback.data.split(":", 1)[1]; data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    data["selected"] = []
+    await redis_client.set(_sync_key(callback.from_user.id, token), json.dumps(data), ex=SYNC_TTL)
+    await callback.answer()
+    await _render_sync_list(callback.message, token, data)
+
+@dp.callback_query(F.data.startswith("sync_p:"))
+async def admin_sync_page(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    _, token, raw_page = callback.data.split(":"); data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    await callback.answer()
+    await _render_sync_list(callback.message, token, data, int(raw_page))
+
+@dp.callback_query(F.data.startswith("sync_go:"))
+async def admin_sync_choose_plan(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    token = callback.data.split(":", 1)[1]; data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    selected = data.get("selected", [])
+    if not selected: return await callback.answer("⚠️ حداقل یک سرویس را انتخاب کنید.", show_alert=True)
+    with SessionLocal() as db:
+        plans = db.query(Plan).filter(Plan.is_active == True).order_by(Plan.id.asc()).all()
+        plan_rows = [(p.id, p.name, p.traffic_gb, p.duration_days, p.price) for p in plans]
+    if not plan_rows: return await callback.answer("❌ هیچ پلن فعالی وجود ندارد.", show_alert=True)
+    data["plan_rows"] = plan_rows; data["plan_pos"] = 0
+    await redis_client.set(_sync_key(callback.from_user.id, token), json.dumps(data), ex=SYNC_TTL)
+    email = data["items"][selected[0]]
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📦 {n} | {gb}GB / {days}روز | {price:,} تومان", callback_data=f"sync_plan:{token}:{pid}")] for pid,n,gb,days,price in plan_rows] + [[InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
+    await callback.message.edit_text(f"📦 <b>انتخاب پلن (1 از {len(selected)})</b>\n\nسرویس: <code>{email}</code>\nبرای هر سرویس یک پلن انتخاب کنید.", reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("sync_plan:"))
+async def admin_sync_plan_selected(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    _, token, raw_plan = callback.data.split(":"); data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    selected = data["selected"]; pos = int(data.get("plan_pos", 0)); data.setdefault("plans", {})[str(selected[pos])] = int(raw_plan)
+    pos += 1; data["plan_pos"] = pos
+    if pos < len(selected):
+        await redis_client.set(_sync_key(callback.from_user.id, token), json.dumps(data), ex=SYNC_TTL)
+        email = data["items"][selected[pos]]; rows = data["plan_rows"]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"📦 {n} | {gb}GB / {days}روز | {price:,} تومان", callback_data=f"sync_plan:{token}:{pid}")] for pid,n,gb,days,price in rows] + [[InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
+        return await callback.message.edit_text(f"📦 <b>انتخاب پلن ({pos + 1} از {len(selected)})</b>\n\nسرویس: <code>{email}</code>", reply_markup=kb, parse_mode="HTML")
+    await redis_client.set(_sync_key(callback.from_user.id, token), json.dumps(data), ex=SYNC_TTL)
+    plan_names = {str(pid): name for pid, name, _, _, _ in data["plan_rows"]}
+    summary_lines = [f"• <code>{data['items'][i]}</code> → {plan_names.get(str(data['plans'][str(i)]), 'پلن نامشخص')}" for i in selected[:20]]
+    if len(selected) > 20:
+        summary_lines.append(f"... و {len(selected) - 20} سرویس دیگر")
+    summary = "\n".join(summary_lines)
+    await callback.message.edit_text(f"🔎 <b>تأیید همگام‌سازی</b>\n━━━━━━━━━━━━━━━━━━\n{summary}\n\nهیچ تغییری در پنل انجام نمی‌شود.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ تأیید", callback_data=f"sync_confirm:{token}")],[InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]]), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("sync_confirm:"))
+async def admin_sync_confirm(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    token = callback.data.split(":", 1)[1]; data = await _load_sync(callback.from_user.id, token)
+    if not data: return await callback.answer("⛔ نشست منقضی شده است.", show_alert=True)
+    try:
+        current = set(await get_xui_client().get_group_emails(str(data["group_id"])))
+        imported = skipped = conflicts = 0
+        with SessionLocal() as db:
+            for idx in data["selected"]:
+                email = data["items"][idx]
+                if email not in current:
+                    skipped += 1; continue
+                if db.query(Invoice).filter(Invoice.client_name == email, Invoice.telegram_user_id != data["group_id"]).first():
+                    conflicts += 1; continue
+                if db.query(Invoice).filter(Invoice.client_name == email, Invoice.telegram_user_id == data["group_id"]).first():
+                    skipped += 1; continue
+                plan_id = data["plans"].get(str(idx))
+                if not plan_id or not db.query(Plan).filter(Plan.id == plan_id, Plan.is_active == True).first():
+                    conflicts += 1; continue
+                db.add(Invoice(telegram_user_id=data["group_id"], plan_id=plan_id, total_price=0, original_price=0, discount_amount=0, client_name=email, action_type="PANEL_SYNC", status="COMPLETE", description="Imported from existing panel group"))
+                imported += 1
+            db.commit()
+        await invalidate_user_service_cache(data["group_id"])
+        await redis_client.delete(_sync_key(callback.from_user.id, token))
+        await callback.message.edit_text(f"✅ <b>همگام‌سازی انجام شد</b>\n\n📥 ثبت‌شده: <b>{imported}</b>\n⏭ ردشده/قبلی: <b>{skipped}</b>\n⚠️ تعارض یا پلن نامعتبر: <b>{conflicts}</b>", reply_markup=get_back_kb("admin_panel"), parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("Panel group sync failed")
+        await callback.answer(f"❌ خطا در همگام‌سازی: {str(exc)[:180]}", show_alert=True)
+
 # ==============================================================================
 # INVOICE APPROVAL
 # ==============================================================================
@@ -3834,7 +4029,6 @@ async def _show_reseller_detail(message, rid):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ شارژ ترافیک", callback_data=f"res_grant_{rid}")],
         [InlineKeyboardButton(text="🔄 تغییر وضعیت", callback_data=f"res_toggle_{rid}")],
-        [InlineKeyboardButton(text="🖧 تنظیم سرورها", callback_data=f"res_inbounds_{rid}")],
         [InlineKeyboardButton(text="🗑 حذف نماینده", callback_data=f"res_delete_{rid}")],
         [InlineKeyboardButton(text="⬅️ بازگشت به لیست", callback_data="admin_list_resellers")]
     ])
@@ -3984,81 +4178,6 @@ async def admin_toggle_reseller_inbound(callback: types.CallbackQuery, state: FS
         return await callback.answer(f"خطا: {str(e)[:80]}", show_alert=True)
     await _render_reseller_inbounds(callback.message, inbounds, selected)
 
-
-# ==============================================================================
-# ADMIN: PER-RESELLER INBOUND CONFIGURATION
-# ==============================================================================
-async def _render_reseller_inbounds_edit(message, inbounds, selected, rid):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{'🟢' if ib['id'] in selected else '🔘'} {ib['remark']} (Port {ib['port']})", callback_data=f"res_ib_edit_{rid}_{ib['id']}")]
-        for ib in inbounds
-    ] + [
-        [InlineKeyboardButton(text="✔️ ذخیره", callback_data=f"res_ib_edit_save_{rid}")],
-        [InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]
-    ])
-    await message.edit_text(
-        f"🖧 <b>تنظیم سرورهای مجاز برای نماینده</b> <code>{rid}</code>\n"
-        "سرورهای مورد نظر را انتخاب کنید (اگر هیچ‌کدام انتخاب نشود، تنظیمات عمومی اعمال می‌شود):",
-        reply_markup=kb, parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("res_inbounds_"))
-async def admin_edit_reseller_inbounds(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in get_admin_ids(): return
-    rid = int(callback.data.split("_")[2])
-    xui = XUIClient()
-    try:
-        inbounds = await xui.get_enabled_inbounds()
-    except Exception as e:
-        return await callback.answer(f"خطا در دریافت سرورها: {str(e)[:80]}", show_alert=True)
-    with SessionLocal() as db:
-        reseller = db.query(Reseller).filter(Reseller.telegram_user_id == rid).first()
-        if not reseller:
-            return await callback.answer("نماینده یافت نشد.", show_alert=True)
-        raw = reseller.inbound_ids or ''
-        selected = set(int(x) for x in raw.split(',') if x.strip().isdigit())
-    await state.update_data(reseller_inbounds_rid=rid, reseller_selected_inbounds=list(selected))
-    await _render_reseller_inbounds_edit(callback.message, inbounds, selected, rid)
-    await state.set_state(AdminFlow.wait_for_reseller_inbounds_edit)
-
-@dp.callback_query(AdminFlow.wait_for_reseller_inbounds_edit, F.data.startswith("res_ib_edit_"))
-async def admin_toggle_reseller_inbound_edit(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in get_admin_ids(): return
-    parts = callback.data.split("_")
-    data = await state.get_data()
-    rid = data.get('reseller_inbounds_rid')
-    if not rid:
-        return await callback.answer("خطا: نماینده مشخص نیست.", show_alert=True)
-    if parts[3] == 'save':
-        # Save selected
-        selected = set(data.get('reseller_selected_inbounds', []))
-        with SessionLocal() as db:
-            reseller = db.query(Reseller).filter(Reseller.telegram_user_id == rid).first()
-            if reseller:
-                reseller.inbound_ids = ','.join(str(i) for i in sorted(selected)) if selected else None
-                db.commit()
-        await state.clear()
-        await callback.message.edit_text(
-            f"✅ <b>سرورهای نماینده <code>{rid}</code> ذخیره شد.</b>",
-            reply_markup=get_admin_menu(), parse_mode="HTML"
-        )
-        await callback.answer()
-        return
-    # Toggle
-    ib_id = int(parts[4])
-    selected = set(data.get('reseller_selected_inbounds', []))
-    if ib_id in selected:
-        selected.remove(ib_id)
-    else:
-        selected.add(ib_id)
-    await state.update_data(reseller_selected_inbounds=list(selected))
-    # Re-render
-    xui = XUIClient()
-    try:
-        inbounds = await xui.get_inbounds()
-    except Exception as e:
-        return await callback.answer(f"خطا: {str(e)[:80]}", show_alert=True)
-    await _render_reseller_inbounds_edit(callback.message, inbounds, selected, rid)
 
 # ==============================================================================
 # ADMIN: BILLING REPORT

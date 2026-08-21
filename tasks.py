@@ -388,22 +388,11 @@ def _refund_reseller_services(email: str, reseller_id: int):
         db.commit()
 
 def _reseller_inbound_ids(db, xui_inbounds: list, reseller_id: int = None) -> list:
+    """Resolve reseller inbounds exclusively from the global setting.
+
+    ``reseller_id`` remains in the signature for compatibility with existing
+    callers. Historical per-reseller values are intentionally ignored.
     """
-    Resolver for inbound IDs for a reseller.
-    Priority: 1) reseller-specific inbound_ids (if set), 2) global reseller_inbound_ids setting, 3) all inbounds.
-    """
-    if reseller_id is not None:
-        res = db.query(Reseller).filter(Reseller.telegram_user_id == reseller_id).first()
-        if res and res.inbound_ids:
-            raw = res.inbound_ids
-            ids = [int(x) for x in raw.split(',') if x.strip().isdigit()]
-            if ids:
-                valid = {ib['id'] for ib in xui_inbounds}
-                filtered = [i for i in ids if i in valid]
-                if len(filtered) != len(ids):
-                    logging.warning(f"Some inbound IDs for reseller {reseller_id} are invalid: {ids}")
-                return filtered
-    # Fallback to global setting
     setting = db.query(AppSetting).filter(AppSetting.key == 'reseller_inbound_ids').first()
     raw = (setting.value if setting else '') or ''
     ids = [int(x) for x in raw.split(',') if x.strip().isdigit()]

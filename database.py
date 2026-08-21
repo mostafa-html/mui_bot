@@ -56,7 +56,7 @@ class Invoice(Base):
     discount_amount = Column(BigInteger, nullable=True)
     coupon_code = Column(String, nullable=True)
     client_name = Column(String, nullable=True)
-    action_type = Column(String, nullable=False)  # NEW, RENEW, TOPUP, TRIAL, REFERRAL_REWARD, RESELLER_NEW/RENEW/TOPUP, MANUAL_RECEIPT, RESELLER_PACK_BUY
+    action_type = Column(String, nullable=False)  # NEW, RENEW, TOPUP, TRIAL, REFERRAL_REWARD, RESELLER_NEW/RENEW/TOPUP, MANUAL_RECEIPT, RESELLER_PACK_BUY, PANEL_SYNC
     screenshot_local_path = Column(String, nullable=True)
     status = Column(String, default="PENDING")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -119,7 +119,9 @@ class Reseller(Base):
     used_bytes = Column(BigInteger, nullable=False, default=0)       # consumed (reserved at create)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    inbound_ids = Column(String, nullable=True)  # comma-separated inbound IDs, NULL means use global setting
+    # Retained for schema compatibility. Runtime provisioning uses only the
+    # global reseller_inbound_ids AppSetting.
+    inbound_ids = Column(String, nullable=True)
 
 class ResellerPack(Base):
     __tablename__ = "reseller_packs"
