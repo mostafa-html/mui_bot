@@ -38,6 +38,7 @@ with engine.begin() as conn:
             quota_bytes BIGINT NOT NULL,
             expiry_date DATETIME NOT NULL,
             status VARCHAR(20),
+            is_trial BOOLEAN DEFAULT 0 NOT NULL,
             invoice_id BIGINT,
             panel_user_id VARCHAR(64),
             panel_username VARCHAR(100),
