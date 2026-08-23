@@ -434,8 +434,9 @@ async def mm_support(message: types.Message):
     await message.answer(
         "🎧 <b>پشتیبانی</b>\n\n"
         "🙋 ما اینجا هستیم تا به شما کمک کنیم.\n"
-        "برای ارتباط با تیم پشتیبانی روی دکمه زیر کلیک کنید:",
+        "قبل از پیام دادن، پاسخ سوالتان شاید همین‌جا باشد:\n",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ راهنمای Amnezia و رفع اشکال", callback_data="amzfaq")],
             [InlineKeyboardButton(text="📨 ارتباط با پشتیبانی", url=support_url)],
             [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu")]
         ]),
@@ -1624,6 +1625,7 @@ async def amz_view_stats(callback: types.CallbackQuery):
         kb_buttons.append(action_row)
     back_cb = "admin_amnezia" if (is_admin_viewer and not owner_only) else "my_plans"
     # Official AmneziaVPN apps
+    kb_buttons.append([InlineKeyboardButton(text="❓ راهنما و رفع اشکال", callback_data="amzfaq")])
     kb_buttons.append([InlineKeyboardButton(text="📱 دانلود برنامه — Android", url=PLAY_STORE_URL),
                        InlineKeyboardButton(text="iOS", url=APP_STORE_URL)])
     kb_buttons.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=back_cb)])
@@ -1653,6 +1655,91 @@ async def amz_show_account_creds(callback: types.CallbackQuery):
         f"🌐 ورود به پنل وب: {panel_url}\n\n"
         f"💡 با این مشخصات می‌توانید در پنل وب وارد شوید و کانفیگ‌های خود را ببینید.",
         parse_mode="HTML")
+
+# ========== Amnezia FAQ (end-user self-service) ==========
+# Ordered (title, html_answer) pairs — indices are baked into callback data
+# (amzfaq_<i>), so APPEND-ONLY: reordering breaks buttons already on screen.
+AMNEZIA_FAQ = [
+    ("🔌 کانفیگ وصل نمی‌شود",
+     "این مراحل را به ترتیب امتحان کنید:\n\n"
+     "1️⃣ اینترنت دستگاه را بررسی کنید (یک سایت را بدون فیلترشکن باز کنید)\n"
+     "2️⃣ در برنامه Amnezia دکمه قطع اتصال را بزنید و دوباره وصل شوید\n"
+     "3️⃣ حالت هواپیما را یک‌بار روشن و خاموش کنید\n"
+     "4️⃣ برنامه Amnezia را کامل ببندید و دوباره باز کنید\n\n"
+     "💡 اگر با Wi-Fi مشکل دارید، با اینترنت همراه امتحان کنید (و برعکس).\n\n"
+     "❓ حل نشد؟ از دکمه «💬 تماس با پشتیبانی» زیر همین صفحه کمک بگیرید."),
+    ("🔄 قبلاً وصل می‌شد، الان نمی‌شود",
+     "دلایل رایج به ترتیب اهمیت:\n\n"
+     "1️⃣ <b>انقضای سرویس</b> — از «📦 سرویس‌های من» سرویس خود را باز کنید و تاریخ انقضا را ببینید؛ اگر منقضی شده، با دکمه 🔄 تمدید فعالش کنید\n"
+     "2️⃣ برنامه Amnezia را کامل ببندید و دوباره باز کنید\n"
+     "3️⃣ گوشی را ری‌استارت کنید\n\n"
+     "💡 بعد از تمدید هم اگر وصل نشد، یک‌بار حالت هواپیما را روشن و خاموش کنید."),
+    ("📶 سرعت کم است",
+     "برای بهبود سرعت:\n\n"
+     "1️⃣ سرعت را بدون فیلترشکن تست کنید تا مطمئن شوید مشکل از اینترنت پایه نیست\n"
+     "2️⃣ در برنامه Amnezia قطع و دوباره وصل شوید\n"
+     "3️⃣ مودم/روتر را ری‌استارت کنید\n"
+     "4️⃣ در ساعات شلوغ شبانه افت سرعت طبیعی است\n\n"
+     "💬 اگر سرعت به‌صورت مداوم پایین است، از دکمه پشتیبانی گزارش دهید تا بررسی شود."),
+    ("📥 چطور لینک vpn:// را وارد کنم؟",
+     "مرحله به مرحله:\n\n"
+     "1️⃣ لینک <code>vpn://...</code> را از ربات لمس کنید تا کپی شود\n"
+     "2️⃣ برنامه Amnezia را باز کنید\n"
+     "3️⃣ روی ➕ (یا Import / افزودن کانفیگ) بزنید\n"
+     "4️⃣ گزینه «Paste from clipboard» یا «ورود داده» را انتخاب کنید\n"
+     "5️⃣ کانفیگ ساخته می‌شود — دکمه اتصال را بزنید ✅"),
+    ("📄 چطور از فایل کانفیگ استفاده کنم؟",
+     "1️⃣ فایل <code>.conf</code> را از ربات دانلود کنید\n"
+     "2️⃣ در برنامه Amnezia روی ➕ بزنید\n"
+     "3️⃣ گزینه «Import from file» / انتخاب فایل را بزنید\n"
+     "4️⃣ فایل دانلودشده را انتخاب و ذخیره کنید\n"
+     "5️⃣ اتصال را روشن کنید ✅"),
+    ("📱 چرا فقط یک دستگاه وصل می‌شود؟",
+     "هر کانکشن Amnezia همزمان فقط روی <b>یک دستگاه</b> کار می‌کند:\n\n"
+     "▫️ وقتی دستگاه دوم وصل می‌شود، دستگاه اول قطع می‌شود\n"
+     "▫️ این محدودیت ذاتی پروتکل است و <b>قابل حذف نیست</b>\n\n"
+     "💡 برای چند دستگاه، برای هر دستگاه یک سرویس جداگانه تهیه کنید."),
+    ("⏳ چقدر حجم و زمان باقی مانده؟",
+     "از منوی اصلی «📦 سرویس‌های من» را باز کنید و روی سرویس Amnezia خود بزنید:\n\n"
+     "📊 مصرف و حجم کل همان‌جا نمایش داده می‌شود\n"
+     "📅 تاریخ انقضا و زمان باقیمانده هم مشخص است\n\n"
+     "🔔 حدود ۳ روز قبل از انقضا، به‌صورت خودکار پیام هشدار دریافت می‌کنید."),
+    ("♻️ سرویس منقضی شده چه کنم؟",
+     "نگران نباشید، اطلاعات شما از بین نمی‌رود:\n\n"
+     "1️⃣ وارد «📦 سرویس‌های من» شوید و سرویس خود را باز کنید\n"
+     "2️⃣ دکمه 🔄 تمدید را بزنید، پلن موردنظر را انتخاب و رسید را ارسال کنید\n\n"
+     "✅ پس از تایید، حجم و زمان تازه اضافه می‌شود و همان کانفیگ قبلی دوباره کار می‌کند.\n"
+     "⚠️ سرویس منقضی پس از چند روز به‌صورت خودکار غیرفعال می‌شود؛ هرچه زودتر تمدید کنید بهتر است."),
+]
+
+@dp.callback_query(F.data == "amzfaq")
+async def amzfaq_menu(callback: types.CallbackQuery):
+    kb_rows = [[InlineKeyboardButton(text=title, callback_data=f"amzfaq_{i}")]
+               for i, (title, _) in enumerate(AMNEZIA_FAQ)]
+    kb_rows.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu")])
+    await callback.message.edit_text(
+        "❓ <b>راهنمای Amnezia و رفع اشکال</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "پاسخ پرتکرارترین سوالات — موضوع خود را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("amzfaq_"))
+async def amzfaq_answer(callback: types.CallbackQuery):
+    try:
+        idx = int(callback.data.split("_")[1])
+        title, answer = AMNEZIA_FAQ[idx]
+    except (ValueError, IndexError):
+        return await callback.answer("⚠️ این سوال یافت نشد.", show_alert=True)
+    with SessionLocal() as db:
+        s = db.query(AppSetting).filter(AppSetting.key == 'support_url').first()
+    support_url = s.value if s else None
+    rows = [[InlineKeyboardButton(text="❓ سوالات دیگر", callback_data="amzfaq")]]
+    bottom_row = [InlineKeyboardButton(text="💬 تماس با پشتیبانی", url=support_url)] if support_url else []
+    bottom_row.append(InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu"))
+    rows.append(bottom_row)
+    await callback.message.edit_text(
+        f"{title}\n━━━━━━━━━━━━━━━━━━\n\n{answer}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_amnezia")
 async def admin_amnezia_menu(callback: types.CallbackQuery):

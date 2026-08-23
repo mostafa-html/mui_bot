@@ -1766,6 +1766,11 @@ def provision_amnezia_new(self, invoice_id: int):
                     [[{"text": "▶️ Google Play", "url": PLAY_STORE_URL},
                       {"text": "🍎 App Store", "url": APP_STORE_URL}]])
 
+                # Self-service FAQ — answers the questions support otherwise would.
+                await notify_user_with_buttons(user_id,
+                    "❓ <b>تازه شروع کردید؟</b> راهنمای قدم‌به‌قدم و رفع اشکال:",
+                    [[{"text": "❓ راهنما و رفع اشکال Amnezia", "callback_data": "amzfaq"}]])
+
                 notifications = referral_notifications + [
                     (user_id,
                      f"🎉 <b>سرویس Amnezia شما فعال شد!</b>\n\n"
