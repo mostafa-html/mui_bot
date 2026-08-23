@@ -18,7 +18,7 @@ load_dotenv()
 # Import shared utilities to avoid duplication
 from src.utils.formatting import format_size
 from src.services.reconcile import compute_reconcile, to_plan
-from src.services.amnezia import AmneziaClient, AmneziaError
+from src.services.amnezia import AmneziaClient, AmneziaError, PLAY_STORE_URL, APP_STORE_URL
 from src.utils.alerting import should_alert, is_noise, format_alert
 
 # ---- Alert admins when a background task fails permanently ----
@@ -1759,6 +1759,12 @@ def provision_amnezia_new(self, invoice_id: int):
                     + f"\n\n🌐 ورود به پنل وب: {os.getenv('AMNEZIA_API_URL', '').rstrip('/')}"
                 )
                 await notify_user(user_id, f"🔐 <b>مشخصات حساب Amnezia این سرویس</b>\n\n{cred_lines}")
+
+                # Point the buyer at the official AmneziaVPN apps (URL buttons).
+                await notify_user_with_buttons(user_id,
+                    "📱 <b>برنامه Amnezia را دانلود کنید:</b>",
+                    [[{"text": "▶️ Google Play", "url": PLAY_STORE_URL},
+                      {"text": "🍎 App Store", "url": APP_STORE_URL}]])
 
                 notifications = referral_notifications + [
                     (user_id,

@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Import config and utilities from src modules
 from src.config import BOT_TOKEN, REQUIRED_CHANNEL_ID, REQUIRED_CHANNEL_LINK, get_admin_ids, amnezia_visible, AMNEZIA_ENABLED
 from src.utils.formatting import format_size, format_price, get_progress_bar, format_expiry_remaining
-from src.services.amnezia import AmneziaClient, AmneziaError, parse_expiration
+from src.services.amnezia import AmneziaClient, AmneziaError, parse_expiration, PLAY_STORE_URL, APP_STORE_URL
 from src.utils.keyboard import (
     get_cancel_kb, get_back_kb, get_main_menu, get_admin_menu, get_reseller_menu,
     get_admin_category_kb, get_join_prompt_kb, JOIN_PROMPT_TEXT
@@ -1623,6 +1623,9 @@ async def amz_view_stats(callback: types.CallbackQuery):
             action_row.append(InlineKeyboardButton(text="➕ خرید حجم اضافه", callback_data=f"amztop_{sid}"))
         kb_buttons.append(action_row)
     back_cb = "admin_amnezia" if (is_admin_viewer and not owner_only) else "my_plans"
+    # Official AmneziaVPN apps
+    kb_buttons.append([InlineKeyboardButton(text="📱 دانلود برنامه — Android", url=PLAY_STORE_URL),
+                       InlineKeyboardButton(text="iOS", url=APP_STORE_URL)])
     kb_buttons.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=back_cb)])
     await callback.message.edit_text(text, parse_mode="HTML",
                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))

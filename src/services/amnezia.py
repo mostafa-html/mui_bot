@@ -43,6 +43,11 @@ SERVER_SWEEP_MAX = 64        # hard stop for the ping sweep
 CACHE_TTL_SECONDS = 3600
 SERVER_NAMES_KEY = "amnezia_server_names"   # Redis hash: server_id -> name
 
+# Official client apps (store entries verified live 2026-08-22 via
+# itunes.apple.com search API + Play Store HTTP check).
+PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=org.amnezia.vpn"
+APP_STORE_URL = "https://apps.apple.com/app/amneziavpn/id1600529900"
+
 logger = logging.getLogger(__name__)
 
 
