@@ -70,9 +70,12 @@ from src.utils.alerting import should_alert, is_noise, format_alert
 @dp.errors()
 async def global_error_handler(event: ErrorEvent):
     exception = event.exception
-    logger.error("Unhandled error processing update", exc_info=exception)
     if is_noise(exception):
+        # routine Telegram chatter (double-taps, identical redraws) — keep a
+        # trace at INFO so real ERROR-level entries stay actionable
+        logger.info("noise suppressed: %s", exception)
         return True
+    logger.error("Unhandled error processing update", exc_info=exception)
     sig = f"{type(exception).__name__}:{str(exception)[:150]}"
     alert_now, suppressed = should_alert(f"bot:{sig}")
     if not alert_now:
@@ -1178,7 +1181,10 @@ async def prompt_custom_gb(message: types.Message, price_str: str, state: FSMCon
     msg += f"(فقط عدد، مثال: <b>10</b>)\n"
     msg += f"<i>حداقل خرید: ۱ گیگابایت</i>"
     if hasattr(message, 'edit_text'):
-        await message.edit_text(msg, parse_mode="HTML", reply_markup=get_cancel_kb())
+        try:
+            await message.edit_text(msg, parse_mode="HTML", reply_markup=get_cancel_kb())
+        except TelegramBadRequest:
+            pass  # double-tap: content already on screen, identical redraw
     else:
         await message.answer(msg, parse_mode="HTML", reply_markup=get_cancel_kb())
     await state.set_state(TopupFlow.wait_for_gb)
