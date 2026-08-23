@@ -60,10 +60,16 @@ async def invalidate_user_service_cache(user_id: int):
 # Any unhandled exception while processing an update is logged AND sent to
 # admins as a rate-limited DM, so failures surface as tickets instead of
 # living only in container logs.
+#
+# CONTRACT (aiogram 3.x): the errors observer passes ONE ErrorEvent object.
+# Declaring (event, exception) parameters instead crashes inside this very
+# handler and silently kills alert delivery — locked by tests/test_error_handler.py.
+from aiogram.types import ErrorEvent
 from src.utils.alerting import should_alert, is_noise, format_alert
 
 @dp.errors()
-async def global_error_handler(event: types.Update, exception: Exception):
+async def global_error_handler(event: ErrorEvent):
+    exception = event.exception
     logger.error("Unhandled error processing update", exc_info=exception)
     if is_noise(exception):
         return True
@@ -74,13 +80,14 @@ async def global_error_handler(event: types.Update, exception: Exception):
 
     ctx = None
     try:
-        if getattr(event, 'message', None):
-            m = event.message
+        upd = event.update
+        if getattr(upd, 'message', None):
+            m = upd.message
             ctx = f"پیام از <code>{m.chat.id}</code>"
             if m.text:
                 ctx += f" — «{m.text[:60]}»"
-        elif getattr(event, 'callback_query', None):
-            cq = event.callback_query
+        elif getattr(upd, 'callback_query', None):
+            cq = upd.callback_query
             ctx = f"دکمه <code>{cq.data}</code> از <code>{cq.from_user.id}</code>"
     except Exception:
         ctx = None
