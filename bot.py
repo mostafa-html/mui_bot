@@ -56,6 +56,43 @@ async def invalidate_user_service_cache(user_id: int):
     await redis_client.delete(f"service_status:{tg_id}")
     await redis_client.delete(f"user_emails:{tg_id}")
 
+# ========== Global error alerting ==========
+# Any unhandled exception while processing an update is logged AND sent to
+# admins as a rate-limited DM, so failures surface as tickets instead of
+# living only in container logs.
+from src.utils.alerting import should_alert, is_noise, format_alert
+
+@dp.errors()
+async def global_error_handler(event: types.Update, exception: Exception):
+    logger.error("Unhandled error processing update", exc_info=exception)
+    if is_noise(exception):
+        return True
+    sig = f"{type(exception).__name__}:{str(exception)[:150]}"
+    alert_now, suppressed = should_alert(f"bot:{sig}")
+    if not alert_now:
+        return True
+
+    ctx = None
+    try:
+        if getattr(event, 'message', None):
+            m = event.message
+            ctx = f"پیام از <code>{m.chat.id}</code>"
+            if m.text:
+                ctx += f" — «{m.text[:60]}»"
+        elif getattr(event, 'callback_query', None):
+            cq = event.callback_query
+            ctx = f"دکمه <code>{cq.data}</code> از <code>{cq.from_user.id}</code>"
+    except Exception:
+        ctx = None
+    alert = format_alert("پردازش آپدیت تلگرام", exception, context=ctx,
+                         suppressed=suppressed)
+    for aid in get_admin_ids():
+        try:
+            await bot.send_message(aid, alert, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Failed to deliver admin alert to {aid}: {e}")
+    return True
+
 # ========== FSM States ==========
 class BuyFlow(StatesGroup):
     wait_for_name = State()
@@ -751,7 +788,7 @@ async def process_coupon(message: types.Message, state: FSMContext):
         data = await state.get_data()
         # action_type is NEW/RENEW/TOPUP (optionally AMNEZIA_-prefixed);
         # coupon applicable keys are new/renewal/topup
-        action = data.get('action_type', 'NEW').lower().replace('amnezia_', '')
+        action = _coupon_action_key(data.get('action_type', 'NEW'))
         action_key = {'renew': 'renewal'}.get(action, action)
         if applicable != 'all':
             allowed = applicable.split(',')
@@ -825,11 +862,51 @@ async def show_payment(message: types.Message, state: FSMContext):
     await state.update_data(last_bot_msg_id=sent.message_id)
     await state.set_state(BuyFlow.wait_for_receipt)
 
+def _build_invoice_kwargs(data: dict) -> dict:
+    """Derive every Invoice field from FSM state — PURE, no I/O.
+
+    This is exactly the seam that once crashed production with
+    ``KeyError: 'client_name'`` (an Amnezia purchase reaching the receipt
+    step stamped as a plain NEW), which is why it lives in one testable
+    function instead of inline kwargs.
+    """
+    action_type = data.get("action_type", "NEW")
+    target_email = data.get("target_email", None)
+    is_amnezia = str(action_type).startswith("AMNEZIA_")
+    amnezia_desc = {k: v for k, v in {
+        "server_id": data.get('amnezia_server_id'),
+        "amz_username": data.get('amz_username'),
+        "amz_password": data.get('amz_password'),
+    }.items() if v is not None}
+    return dict(
+        plan_id=data.get('plan_id', None),
+        added_gb=data.get('added_gb', None),
+        total_price=data.get('final_price', 0),
+        original_price=data.get('original_price', 0),
+        discount_amount=data.get('discount_amount', 0),
+        coupon_code=data.get('coupon_code'),
+        # Amnezia names are auto-assigned at provisioning time
+        # (amz_{user}_{invoice}); the chosen server and the optional panel
+        # account credentials ride in the description JSON.
+        client_name=(None if is_amnezia else (target_email if target_email else data.get('client_name'))),
+        action_type=action_type,
+        amnezia_service_id=data.get('target_service_id') if is_amnezia else None,
+        description=(json.dumps(amnezia_desc) if is_amnezia and amnezia_desc else None),
+    )
+
+
+def _coupon_action_key(action_type: str) -> str:
+    """Map an invoice action_type onto coupon ``applicable_to`` vocabulary:
+    new/renewal/topup (AMNEZIA_ prefixes collapse onto their base action)."""
+    base = (action_type or 'NEW').lower().replace('amnezia_', '')
+    return {'renew': 'renewal'}.get(base, base)
+
+
 @dp.message(BuyFlow.wait_for_receipt, F.photo)
 async def process_receipt(message: types.Message, state: FSMContext):
     # Show typing indicator while processing
     await bot.send_chat_action(message.chat.id, "upload_photo")
-    
+
     # Check file size
     max_size_mb = 10
     with SessionLocal() as db:
@@ -840,42 +917,19 @@ async def process_receipt(message: types.Message, state: FSMContext):
     if message.photo[-1].file_size > max_bytes:
         await message.answer(f"⚠️ حجم عکس بیش از حد مجاز ({max_size_mb} MB) است. لطفاً عکس را فشرده کنید و دوباره ارسال نمایید.", reply_markup=get_cancel_kb())
         return
-    
+
     data = await state.get_data()
     photo = message.photo[-1]
     file_path = f"./storage/receipts/{message.from_user.id}_{time.time_ns()}.jpg"
     await bot.download(photo, destination=file_path)
 
-    action_type = data.get("action_type", "NEW")
-    target_email = data.get("target_email", None)
-    final_price = data.get("final_price", 0)
-    original_price = data.get("original_price", 0)
-    discount_amount = data.get("discount_amount", 0)
-    coupon_code = data.get("coupon_code")
-    is_amnezia = str(action_type).startswith("AMNEZIA_")
-
     with SessionLocal() as db:
         invoice = Invoice(
             telegram_user_id=message.from_user.id,
-            plan_id=data.get('plan_id', None),
-            added_gb=data.get('added_gb', None),
-            total_price=final_price,
-            original_price=original_price,
-            discount_amount=discount_amount,
-            coupon_code=coupon_code,
-            # Amnezia names are auto-assigned at provisioning time
-            # (amz_{user}_{invoice}); the chosen server and the optional panel
-            # account credentials ride in the description JSON.
-            client_name=(None if is_amnezia else (target_email if target_email else data.get('client_name'))),
-            action_type=action_type,
             screenshot_local_path=file_path,
-            amnezia_service_id=data.get('target_service_id') if is_amnezia else None,
-            description=(json.dumps({k: v for k, v in {
-                "server_id": data.get('amnezia_server_id'),
-                "amz_username": data.get('amz_username'),
-                "amz_password": data.get('amz_password'),
-            }.items() if v is not None}) if is_amnezia else None),
+            **_build_invoice_kwargs(data),
         )
+        db.add(invoice)
         db.add(invoice)
         db.commit()
         db.refresh(invoice)
@@ -5785,8 +5839,24 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="menu", description="باز کردن منوی اصلی"),
     ])
 
+async def heartbeat_writer():
+    """Dead-man's switch: touch a Redis key every minute (TTL 5 min).
+
+    The worker's ``system_heartbeat`` beat task reads this key; if it goes
+    stale the bot process is presumed dead and admins are alerted — even
+    though the worker itself is still perfectly alive.
+    """
+    while True:
+        try:
+            await redis_client.set("bot:heartbeat",
+                                   datetime.now(timezone.utc).isoformat(), ex=300)
+        except Exception as e:
+            logger.warning(f"heartbeat write failed: {e}")
+        await asyncio.sleep(60)
+
 async def main():
     await setup_bot_commands(bot)
+    asyncio.create_task(heartbeat_writer(), name="heartbeat_writer")
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == '__main__':

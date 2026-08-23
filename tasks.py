@@ -19,6 +19,35 @@ load_dotenv()
 from src.utils.formatting import format_size
 from src.services.reconcile import compute_reconcile, to_plan
 from src.services.amnezia import AmneziaClient, AmneziaError
+from src.utils.alerting import should_alert, is_noise, format_alert
+
+# ---- Alert admins when a background task fails permanently ----
+# Autoretried tasks only reach this on FINAL failure (intermediate retries
+# emit task_retry instead), so a page here means real, unrecovered breakage.
+from celery.signals import task_failure
+
+@task_failure.connect
+def alert_on_task_failure(sender=None, task_id=None, exception=None,
+                          args=None, kwargs=None, **kw):
+    try:
+        if exception is None or is_noise(exception):
+            return
+        task_name = getattr(sender, 'name', str(sender)) or 'unknown-task'
+        sig = f"{type(exception).__name__}:{str(exception)[:150]}"
+        alert_now, suppressed = should_alert(f"worker:{sig}")
+        if not alert_now:
+            return
+        ctx = (f"وظیفه <code>{task_name}</code> | id <code>{task_id}</code>\n"
+               f"args: <code>{str(args)[:150]}</code>")
+        alert = format_alert("وظیفه پس‌زمینه", exception, context=ctx,
+                             suppressed=suppressed)
+
+        async def _send():
+            admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+            await notify_many_users([(aid, alert) for aid in admin_ids])
+        run_async(_send())
+    except Exception:
+        logging.error("failed to deliver task-failure alert", exc_info=True)
 
 REDIS_URL = os.getenv('REDIS_URL')
 
@@ -96,6 +125,14 @@ celery_app.conf.beat_schedule = {
     'check_amnezia_servers': {
         'task': 'tasks.check_amnezia_servers',
         'schedule': crontab(minute=5),  # hourly
+    },
+    'system_heartbeat': {
+        'task': 'tasks.system_heartbeat',
+        'schedule': crontab(minute='*/10'),  # dead-man's-switch checker
+    },
+    'daily_status_digest': {
+        'task': 'tasks.daily_status_digest',
+        'schedule': crontab(hour=21, minute=0),
     },
 }
 
@@ -2106,4 +2143,98 @@ def check_amnezia_servers():
                 await notify_many_users(notifications)
         finally:
             await amz.close()
+    run_async(_run())
+
+
+# ---- Watchdog: dead-man's switch + daily status digest ----
+# The BOT process touches the Redis key "bot:heartbeat" every minute (TTL
+# 5 min). This worker-side task reads it: if the key is gone, the bot
+# process is presumed dead even though the worker itself is healthy.
+
+@celery_app.task
+def system_heartbeat():
+    """Every 10 minutes: verify the bot's heartbeat key and DB liveness.
+
+    Silent when everything is healthy (a daily digest proves the worker
+    itself is alive); alerts admins with cooldown when the bot process or
+    the database looks down, and sends a recovery notice when they return.
+    """
+    async def _run():
+        import redis.asyncio as aioredis
+        now = datetime.now(timezone.utc)
+        r = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            # 1) Bot process liveness
+            raw = await r.get("bot:heartbeat")
+            bot_age = None
+            if raw:
+                try:
+                    bot_age = (now - datetime.fromisoformat(raw)).total_seconds()
+                except ValueError:
+                    pass
+            if raw is None or (bot_age is not None and bot_age > 300):
+                ok, suppressed = should_alert("bot-down", cooldown_seconds=1800)
+                if ok:
+                    await r.set("alert:bot-down", "1", ex=7200)
+                    await notify_many_users([(aid,
+                        f"🚨 <b>پروسه ربات بی‌پاسخ شد!</b>\n\n"
+                        f"آخرین تپ: <code>{'هرگز' if raw is None else f'{int(bot_age)} ثانیه پیش'}</code>\n"
+                        f"ورکر فعال است اما ربات پاسخ نمی‌دهد. لاگ‌های کانتینر bot را بررسی کنید.")
+                        for aid in _admin_ids()])
+            elif await r.exists("alert:bot-down"):
+                await r.delete("alert:bot-down")
+                await notify_many_users([(aid,
+                    "✅ <b>ربات دوباره پاسخ داد.</b>\nمانیتور بات‌داون رفع شد.")
+                    for aid in _admin_ids()])
+
+            # 2) Database liveness
+            try:
+                with SessionLocal() as db:
+                    db.execute(text("SELECT 1"))
+            except Exception as e:
+                ok, suppressed = should_alert(f"db-down:{str(e)[:80]}", cooldown_seconds=1800)
+                if ok:
+                    await notify_many_users([(aid, format_alert("اتصال دیتابیس", e))
+                                             for aid in _admin_ids()])
+        finally:
+            await r.aclose()
+    run_async(_run())
+
+
+@celery_app.task
+def daily_status_digest():
+    """Daily 21:00 proof-of-life summary. If THIS message stops arriving,
+    the worker (or its beat scheduler) is down — absence is the alarm."""
+    async def _run():
+        import redis.asyncio as aioredis
+        now = datetime.now(timezone.utc)
+        r = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            raw = await r.get("bot:heartbeat")
+            bot_age = None
+            if raw:
+                try:
+                    bot_age = int((now - datetime.fromisoformat(raw)).total_seconds())
+                except ValueError:
+                    pass
+            queue_len = await r.llen("celery")
+            db_ok = True
+            try:
+                with SessionLocal() as db:
+                    db.execute(text("SELECT 1"))
+            except Exception:
+                db_ok = False
+            msg = (
+                "📋 <b>گزارش روزانه سلامت سیستم</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 ربات: {'✅ فعال' if bot_age is not None and bot_age <= 300 else '🔴 بی‌پاسخ'}"
+                + (f" (آخرین تپ {bot_age} ثانیه پیش)" if bot_age is not None else "") + "\n"
+                f"⚙️ ورکر: ✅ فعال (این پیام)\n"
+                f"🗄 دیتابیس: {'✅' if db_ok else '🔴 خطا'}\n"
+                f"📬 صف وظایف: {queue_len} مورد در انتظار\n"
+                f"🕐 {now.strftime('%Y-%m-%d %H:%M')} UTC"
+            )
+            await notify_many_users([(aid, msg) for aid in _admin_ids()])
+        finally:
+            await r.aclose()
     run_async(_run())

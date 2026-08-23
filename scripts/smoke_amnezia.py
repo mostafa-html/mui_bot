@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['SKIP_DB_INIT'] = 'true'
 os.environ['DATABASE_URL'] = 'sqlite:///storage/test_amnezia.db'
 os.environ['AMNEZIA_API_URL'] = 'https://rahanet.aethera.ir:5000'
-os.environ.setdefault('AMNEZIA_API_USERNAME', os.getenv('AMNEZIA_API_USERNAME', ''))
-os.environ.setdefault('AMNEZIA_API_PASSWORD', os.getenv('AMNEZIA_API_PASSWORD', ''))
+# credentials come from .env via load_dotenv
+# credentials come from .env via load_dotenv
 
 import logging
 logging.basicConfig(level=logging.INFO)

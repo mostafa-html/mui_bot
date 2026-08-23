@@ -14,8 +14,8 @@ os.environ['BOT_TOKEN'] = '123456:dummy-token-not-real'
 os.environ['ADMIN_CHAT_IDS'] = ''
 os.environ['REDIS_URL'] = 'redis://localhost:6390/0'   # unreachable: name cache must degrade gracefully
 os.environ['AMNEZIA_API_URL'] = 'https://rahanet.aethera.ir:5000'
-os.environ.setdefault('AMNEZIA_API_USERNAME', os.getenv('AMNEZIA_API_USERNAME', ''))
-os.environ.setdefault('AMNEZIA_API_PASSWORD', os.getenv('AMNEZIA_API_PASSWORD', ''))
+# credentials come from .env via load_dotenv
+# credentials come from .env via load_dotenv
 
 logging.basicConfig(level=logging.WARNING)
 
