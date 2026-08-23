@@ -9,7 +9,7 @@ from celery.schedules import crontab
 import redis.asyncio as redis
 import httpx
 from sqlalchemy import text
-from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService
+from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService, AmneziaTrial
 from xui_client import XUIClient
 
 from dotenv import load_dotenv
@@ -1979,6 +1979,113 @@ def delete_amnezia_service(self, service_id: int):
     run_async(_run())
 
 
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+def provision_amnezia_trial(self, user_id: int):
+    """One free Amnezia trial per Telegram user.
+
+    Entitlement lives in ``amnezia_trials`` (independent of XUI TrialUsage).
+    Size/duration reuse the existing 🎁 trial settings. The service row is
+    flagged ``is_trial=True`` so the expiry sweep DELETES the whole panel
+    account at expiry — trials never accumulate on the panel.
+    """
+    import math
+
+    async def _run():
+        try:
+            with SessionLocal() as db:
+                # re-check entitlement (the handler guards too; retries may land later)
+                if db.query(AmneziaTrial).filter(
+                        AmneziaTrial.telegram_user_id == user_id).first():
+                    return
+                gb_s = db.query(AppSetting).filter(AppSetting.key == 'trial_traffic_gb').first()
+                d_s = db.query(AppSetting).filter(AppSetting.key == 'trial_duration_days').first()
+            traffic_gb = float(gb_s.value) if gb_s else 0.1
+            days = int(d_s.value) if d_s else 1
+            # Panel traffic_limit is whole-GB only — and 0 means UNLIMITED,
+            # so a sub-GB trial must round UP, never down/truncate.
+            trial_gb = max(1, math.ceil(traffic_gb))
+
+            amz = AmneziaClient()
+            try:
+                acct = await amz.ensure_service_account(
+                    user_id, base_username=f"trial{user_id}", invoice_id=None)
+                servers = await amz.list_servers()
+                alive = [s for s in servers if s.get('alive', True)]
+                server_id = (alive or servers)[0]['id']
+                conn_name = f"trial_{user_id}_{int(time.time())}"
+                created = await amz.add_connection(acct['panel_user_id'], server_id, conn_name)
+
+                now = datetime.now(timezone.utc)
+                expiry = now + timedelta(days=days)
+                await amz.update_user_limits(acct['panel_user_id'], user_id,
+                                             quota_gb=trial_gb, expiry=expiry)
+
+                with SessionLocal() as db:
+                    svc = AmneziaService(
+                        telegram_user_id=user_id,
+                        connection_id=created['connection_id'],
+                        client_id=created['client_id'],
+                        server_id=created['server_id'],
+                        server_name=created.get('server_name'),
+                        protocol=created.get('protocol') or amz.protocol,
+                        name=conn_name,
+                        quota_bytes=trial_gb * 1024 ** 3,
+                        expiry_date=expiry,
+                        status='active',
+                        is_trial=True,
+                        panel_user_id=acct['panel_user_id'],
+                        panel_username=acct['username'],
+                        panel_password=acct['password'],
+                    )
+                    db.add(svc)
+                    db.flush()
+                    claim = AmneziaTrial(telegram_user_id=user_id, service_id=svc.id)
+                    db.add(claim)
+                    invoice = Invoice(
+                        telegram_user_id=user_id,
+                        total_price=0, original_price=0, discount_amount=0,
+                        client_name=conn_name,
+                        action_type='AMNEZIA_TRIAL', status='COMPLETE',
+                        amnezia_service_id=svc.id,
+                    )
+                    db.add(invoice)
+                    db.commit()
+                    service_id = svc.id
+
+                cfg = await amz.get_connection_config(created['server_id'], created['client_id'])
+                vpn_link = cfg.get('vpn_link')
+                config_text = cfg.get('config') or ''
+                size_display = f"{traffic_gb:g}".rstrip('.') if traffic_gb < 1 else str(trial_gb)
+                await notify_user(user_id,
+                    f"🎁 <b>تست رایگان Amnezia شما فعال شد!</b>\n\n"
+                    f"📦 حجم: {size_display} GB\n⏳ مدت: {days} روز\n"
+                    f"⚠️ پس از انقضا، این سرویس به‌صورت خودکار حذف می‌شود.")
+                if vpn_link:
+                    await notify_user(user_id,
+                        f"🔗 <b>لینک اتصال:</b>\n<code>{vpn_link}</code>\n\n"
+                        f"👆 کپی و در برنامه Amnezia گزینه Import بزنید.")
+                if config_text:
+                    await send_user_document(user_id, f"{conn_name}.conf",
+                                             config_text.encode('utf-8'),
+                                             "📄 فایل کانفیگ تست رایگان")
+                await notify_user_with_buttons(user_id,
+                    "📱 <b>برنامه Amnezia را دانلود کنید:</b>",
+                    [[{"text": "▶️ Google Play", "url": PLAY_STORE_URL},
+                      {"text": "🍎 App Store", "url": APP_STORE_URL}],
+                     [{"text": "❓ راهنما و رفع اشکال", "callback_data": "amzfaq"}]])
+                admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+                await notify_many_users([(aid,
+                    f"🎁 <b>تریال Amnezia جدید</b>\n👤 <code>{user_id}</code> | "
+                    f"🖥 {created.get('server_name') or server_id} | 📦 {trial_gb}GB/{days}روز")
+                    for aid in admin_ids])
+            finally:
+                await amz.close()
+        except Exception as e:
+            logging.error(f"provision_amnezia_trial failed for {user_id}: {e}")
+            raise
+    run_async(_run())
+
+
 @celery_app.task
 def check_amnezia_expiry():
     """Daily Amnezia expiry sweep: warn once ≤3 days before expiry; on expiry
@@ -2003,7 +2110,27 @@ def check_amnezia_expiry():
                         exp = (stats or {}).get('expiration_date') or svc.expiry_date
                         if not exp:
                             continue
+                        if exp.tzinfo is None:
+                            # SQLite/edge sources may return naive datetimes
+                            exp = exp.replace(tzinfo=timezone.utc)
                         days_left = (exp - now).days
+
+                        # Trials: DELETE the whole panel account at expiry
+                        # (cascade removes the connection) — this is what keeps
+                        # trial entities from accumulating on the panel.
+                        if svc.is_trial:
+                            if exp <= now:
+                                try:
+                                    await amz.delete_panel_user(svc.panel_user_id)
+                                except AmneziaError as e:
+                                    if 'not found' not in str(e).lower():
+                                        raise
+                                svc.status = 'deleted'
+                                notifications.append((svc.telegram_user_id,
+                                    f"⏳ <b>تست رایگان Amnezia شما به پایان رسید و حذف شد.</b>\n\n"
+                                    f"خوشحال می‌شویم با خرید یکی از پلن‌ها ادامه دهید 🌟"))
+                            continue  # trials get no expiry warnings — short-lived by design
+
                         if exp <= now:
                             await amz.set_user_enabled(svc.panel_user_id, enabled=False)
                             svc.status = 'expired'

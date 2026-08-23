@@ -106,6 +106,7 @@ ADMIN_CATEGORIES = {
     "admcat_amnezia": ("🟣 Amnezia", [
         ("📦 سرویس‌های Amnezia", "admin_amnezia"),
         ("➕ افزودن پلن Amnezia", "admin_add_plan_amz"),
+        ("♻️ ریست تریال همه کاربران", "admztrial_reset"),
     ]),
     "admcat_maint": ("🔧 تعمیر و نگهداری", [
         ("🔧 تعمیر سرویس‌های نامرئی", "admin_reconcile_names"),

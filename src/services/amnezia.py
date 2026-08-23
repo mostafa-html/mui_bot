@@ -490,12 +490,13 @@ class AmneziaClient:
         No adoption of pre-existing accounts happens here by design.
 
         Username: ``<base>_<invoice_id>`` (base = chosen username or tg_<id>);
-        a random suffix is appended on the rare collision.
+        when ``invoice_id`` is None the bare base is used (trials); a random
+        suffix is appended on the rare collision.
 
         Returns {"panel_user_id", "username", "password"}.
         """
         base = (base_username or f"tg_{telegram_id}").strip()[:24]
-        desired = f"{base}_{invoice_id}"
+        desired = f"{base}_{invoice_id}" if invoice_id is not None else base
         data = await self._request('GET', '/api/users',
                                    params={"search": desired, "page": 1, "size": 10})
         if any(u.get('username') == desired for u in data.get('users', [])):

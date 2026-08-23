@@ -135,6 +135,15 @@ class ResellerPack(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     is_active = Column(Boolean, default=True)   # becomes False when expired or fully used
 
+class AmneziaTrial(Base):
+    """One Amnezia free-trial entitlement per Telegram user (independent of
+    the XUI TrialUsage records). Admin reset-all empties this table."""
+    __tablename__ = "amnezia_trials"
+    telegram_user_id = Column(BigInteger, primary_key=True, index=True)
+    service_id = Column(BigInteger, nullable=True, index=True)  # the trial AmneziaService
+    claimed_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class PanelTraffic(Base):
     __tablename__ = "panel_traffic"
     id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
@@ -177,6 +186,7 @@ class AmneziaService(Base):
     quota_bytes = Column(BigInteger, nullable=False)          # total traffic limit (bytes)
     expiry_date = Column(DateTime(timezone=True), nullable=False)
     status = Column(String(20), default='active', nullable=False)  # active/expired/deleted
+    is_trial = Column(Boolean, default=False, nullable=False)  # trials are DELETED (account+connection) at expiry to keep the panel lean
     invoice_id = Column(BigInteger, nullable=True, index=True)     # creating invoice
     # Each subscription owns a DEDICATED panel account: quota/expiry and
     # enable/disable are panel-account-level, so isolation requires 1:1
@@ -329,6 +339,7 @@ def run_migrations():
             'panel_user_id': 'VARCHAR',
             'panel_username': 'VARCHAR',
             'panel_password': 'VARCHAR',
+            'is_trial': 'BOOLEAN DEFAULT 0 NOT NULL' if not IS_SQLITE else 'BOOLEAN DEFAULT 0 NOT NULL',
         }.items():
             if col_name not in amnezia_service_columns:
                 with engine.connect() as conn:

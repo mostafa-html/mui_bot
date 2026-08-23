@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BotCommand, BufferedInputFile
-from database import SessionLocal, Plan, Invoice, AppSetting, TrialUsage, Coupon, CouponUsage, ReferralCode, Referral, Reseller, ResellerPack, PanelTraffic, TrafficPack, AmneziaUser, AmneziaService
+from database import SessionLocal, Plan, Invoice, AppSetting, TrialUsage, Coupon, CouponUsage, ReferralCode, Referral, Reseller, ResellerPack, PanelTraffic, TrafficPack, AmneziaUser, AmneziaService, AmneziaTrial
 from sqlalchemy import func
 import redis.asyncio as redis
 from xui_client import XUIClient, get_xui_client
@@ -418,7 +418,7 @@ async def mm_free_trial(message: types.Message, state: FSMContext):
             "💡 در ضمن، می‌توانید از اشتراک‌های ویژه ما استفاده کنید!",
             parse_mode="HTML"
         )
-    text, kb = await free_trial_content()
+    text, kb = await free_trial_content(user_id=message.from_user.id)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
     await state.set_state(TrialFlow.wait_for_name)
 
@@ -574,8 +574,11 @@ async def claim_reward(callback: types.CallbackQuery):
 # ==============================================================================
 # FREE TRIAL
 # ==============================================================================
-async def free_trial_content() -> tuple:
-    """Shared logic for free trial text. Returns (text, reply_markup)."""
+async def free_trial_content(user_id: int = None) -> tuple:
+    """Shared logic for free trial text. Returns (text, reply_markup).
+
+    When Amnezia is visible to ``user_id``, a second claim option
+    (🟣 تست رایگان Amnezia) is offered alongside the XUI trial."""
     with SessionLocal() as db:
         traffic_setting = db.query(AppSetting).filter(AppSetting.key == 'trial_traffic_gb').first()
         days_setting = db.query(AppSetting).filter(AppSetting.key == 'trial_duration_days').first()
@@ -592,7 +595,12 @@ async def free_trial_content() -> tuple:
         f"▫️ فقط حروف انگلیسی (a-z, A-Z)\n"
         f"▫️ مثال: <code>ali</code> یا <code>myVPN</code>"
     )
-    return text, get_cancel_kb()
+    kb_rows = []
+    if user_id is not None and amnezia_visible(user_id):
+        text += "\n\n🟣 <b>یا:</b> تست رایگان Amnezia دریافت کنید (بدون نیاز به ثبت نام):"
+        kb_rows.append([InlineKeyboardButton(text="🟣 تست رایگان Amnezia", callback_data="free_trial_amz")])
+    kb_rows.append([InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
 @dp.callback_query(F.data == "free_trial")
 async def free_trial_start_cb(callback: types.CallbackQuery, state: FSMContext):
@@ -603,10 +611,76 @@ async def free_trial_start_cb(callback: types.CallbackQuery, state: FSMContext):
             show_alert=True
         )
         return
-    text, kb = await free_trial_content()
+    text, kb = await free_trial_content(user_id=callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await state.update_data(last_bot_msg_id=callback.message.message_id)
     await state.set_state(TrialFlow.wait_for_name)
+
+@dp.callback_query(F.data == "free_trial_amz")
+async def free_trial_amz_cb(callback: types.CallbackQuery, state: FSMContext):
+    """Claim the one-per-user Amnezia free trial (independent of XUI trial)."""
+    await state.clear()
+    uid = callback.from_user.id
+    if not amnezia_visible(uid):
+        return await callback.answer("⛔ این بخش در دسترس شما نیست.", show_alert=True)
+    with SessionLocal() as db:
+        already = db.query(AmneziaTrial).filter(
+            AmneziaTrial.telegram_user_id == uid).first() is not None
+        active_trial = db.query(AmneziaService).filter(
+            AmneziaService.telegram_user_id == uid,
+            AmneziaService.is_trial == True,
+            AmneziaService.status == 'active').first() is not None
+    if already or active_trial:
+        return await callback.answer(
+            "🎁 شما قبلاً تست رایگان Amnezia را دریافت کرده‌اید.\n"
+            "آن را در «📦 سرویس‌های من» ببینید.",
+            show_alert=True)
+    tasks.provision_amnezia_trial.delay(uid)
+    await callback.message.edit_text(
+        "🟣 <b>در حال آماده‌سازی تست رایگان Amnezia…</b>\n\n"
+        "لینک اتصال و فایل کانفیگ در پیام بعدی ارسال می‌شود 🙏",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu")]
+        ]), parse_mode="HTML")
+
+def _reset_amnezia_trials(db) -> int:
+    """PURE-ish: clear every Amnezia trial entitlement; returns count cleared.
+    Leftover expired trial entities self-clean via the expiry sweep."""
+    n = db.query(AmneziaTrial).count()
+    db.query(AmneziaTrial).delete()
+    return n
+
+@dp.callback_query(F.data == "admztrial_reset")
+async def admin_amztrial_reset_ask(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids():
+        return
+    with SessionLocal() as db:
+        n = db.query(AmneziaTrial).count()
+    await callback.message.edit_text(
+        "♻️ <b>ریست تریال‌های Amnezia</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"▫️ تعداد مجوزهای ثبت‌شده: <b>{n}</b>\n"
+        "▫️ پس از ریست، <b>همه کاربران</b> می‌توانند دوباره تریال بگیرند.\n"
+        "▫️ سرویس‌های تریلی منقضی، طی حداکثر یک ساعت توسط پاکساز خودکار از پنل حذف می‌شوند.\n\n"
+        "آیا مطمئن هستید؟",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"♻️ بله، ریست {n} مجوز", callback_data="admztrial_reset_go")],
+            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_amnezia")],
+        ]), parse_mode="HTML")
+
+@dp.callback_query(F.data == "admztrial_reset_go")
+async def admin_amztrial_reset_go(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids():
+        return
+    with SessionLocal() as db:
+        n = _reset_amnezia_trials(db)
+        db.commit()
+    logger.info(f"amnezia trials reset by admin {callback.from_user.id}: {n} claims cleared")
+    await callback.message.edit_text(
+        f"✅ <b>{n} مجوز تریال پاک شد.</b>\n\nهمه کاربران می‌توانند دوباره تریال بگیرند.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ بازگشت به Amnezia", callback_data="admin_amnezia")],
+        ]), parse_mode="HTML")
 
 @dp.message(TrialFlow.wait_for_name)
 async def trial_name(message: types.Message, state: FSMContext):
