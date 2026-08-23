@@ -78,3 +78,34 @@ def seed_plan(plan_id, name='Amz 10GB', gb=10, days=30, price=100000, service_ty
 import database  # noqa: E402,F401  (initialises schema on the sqlite file)
 import tasks      # noqa: E402,F401
 import bot        # noqa: E402,F401
+
+# SQLite cannot autoincrement BigInteger PKs (PostgreSQL generates BIGSERIAL
+# and is unaffected) — swap invoices to an INTEGER PK so handler tests can
+# insert through the ORM exactly as production does.
+from sqlalchemy import text  # noqa: E402
+with database.engine.begin() as conn:
+    conn.execute(text("DROP TABLE IF EXISTS invoices"))
+    conn.execute(text("""
+        CREATE TABLE invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id BIGINT NOT NULL,
+            plan_id BIGINT,
+            added_gb BIGINT,
+            total_price BIGINT,
+            original_price BIGINT,
+            discount_amount BIGINT,
+            coupon_code VARCHAR,
+            client_name VARCHAR,
+            action_type VARCHAR NOT NULL,
+            screenshot_local_path VARCHAR,
+            status VARCHAR DEFAULT 'PENDING',
+            created_at DATETIME,
+            reseller_id BIGINT,
+            reservation_data TEXT,
+            refund_data TEXT,
+            description VARCHAR,
+            pack_id BIGINT,
+            deletion_scheduled_at DATETIME,
+            deletion_warning_sent_count INTEGER DEFAULT 0 NOT NULL,
+            amnezia_service_id INTEGER
+        )"""))

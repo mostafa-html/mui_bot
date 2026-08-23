@@ -931,13 +931,23 @@ async def process_receipt(message: types.Message, state: FSMContext):
     file_path = f"./storage/receipts/{message.from_user.id}_{time.time_ns()}.jpg"
     await bot.download(photo, destination=file_path)
 
+    # Derive everything ONCE here; the rest of this handler (coupon locking,
+    # admin caption) reads these locals — they used to be inline assignments
+    # and were lost in the _build_invoice_kwargs extraction (NameError).
+    inv_kwargs = _build_invoice_kwargs(data)
+    action_type = inv_kwargs['action_type']
+    is_amnezia = str(action_type).startswith("AMNEZIA_")
+    coupon_code = data.get('coupon_code')
+    final_price = data.get('final_price', 0)
+    original_price = data.get('original_price', 0)
+    discount_amount = data.get('discount_amount', 0)
+
     with SessionLocal() as db:
         invoice = Invoice(
             telegram_user_id=message.from_user.id,
             screenshot_local_path=file_path,
-            **_build_invoice_kwargs(data),
+            **inv_kwargs,
         )
-        db.add(invoice)
         db.add(invoice)
         db.commit()
         db.refresh(invoice)
