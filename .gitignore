@@ -1,4 +1,3 @@
-```
 # Database files
 *.db
 storage/*.db
@@ -35,3 +34,10 @@ Thumbs.db
 
 /.claude
 .claude
+api-documentation.md
+
+# Session/tooling & runtime data
+.zcode/
+storage/
+logs/
+celerybeat-schedule*

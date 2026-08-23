@@ -9,7 +9,7 @@ from celery.schedules import crontab
 import redis.asyncio as redis
 import httpx
 from sqlalchemy import text
-from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack
+from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService
 from xui_client import XUIClient
 
 from dotenv import load_dotenv
@@ -18,6 +18,7 @@ load_dotenv()
 # Import shared utilities to avoid duplication
 from src.utils.formatting import format_size
 from src.services.reconcile import compute_reconcile, to_plan
+from src.services.amnezia import AmneziaClient, AmneziaError
 
 REDIS_URL = os.getenv('REDIS_URL')
 
@@ -88,6 +89,14 @@ celery_app.conf.beat_schedule = {
         'task': 'tasks.check_expired_services_for_deletion',
         'schedule': crontab(hour=10, minute=0),  # Daily at 10 AM
     },
+    'check_amnezia_expiry': {
+        'task': 'tasks.check_amnezia_expiry',
+        'schedule': crontab(hour=9, minute=30),
+    },
+    'check_amnezia_servers': {
+        'task': 'tasks.check_amnezia_servers',
+        'schedule': crontab(minute=5),  # hourly
+    },
 }
 
 # Single event loop per task — all coroutines grouped together
@@ -105,28 +114,48 @@ async def invalidate_cache(tg_id: int):
     finally:
         await r.aclose()
 
-async def notify_user(tg_id: int, text: str):
+async def notify_user(tg_id: int, text: str, effect: str = None):
     bot_token = os.getenv('BOT_TOKEN')
     if bot_token:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": tg_id, "text": text, "parse_mode": "HTML"}
+        # Message effects (Bot API 7.4+) work in private chats for ALL users.
+        # An invalid id makes Telegram reject just this send, which the raw
+        # POST ignores — so a bad constant can never break a notification.
+        if effect:
+            payload["message_effect_id"] = effect
         async with httpx.AsyncClient() as client:
-            await client.post(url, json={"chat_id": tg_id, "text": text, "parse_mode": "HTML"})
+            await client.post(url, json=payload)
 
 async def notify_many_users(notifications: list):
-    """Send multiple notifications in a single event loop with rate limiting."""
+    """Send multiple notifications in a single event loop with rate limiting.
+
+    Each entry is ``(tg_id, text)`` or ``(tg_id, text, effect_id)``."""
     bot_token = os.getenv('BOT_TOKEN')
     if not bot_token:
         return
     async with httpx.AsyncClient() as client:
-        for i, (tg_id, text) in enumerate(notifications):
+        for i, item in enumerate(notifications):
+            tg_id, text = item[0], item[1]
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {"chat_id": tg_id, "text": text, "parse_mode": "HTML"}
+            if len(item) > 2 and item[2]:
+                payload["message_effect_id"] = item[2]
             try:
-                await client.post(url, json={"chat_id": tg_id, "text": text, "parse_mode": "HTML"})
+                await client.post(url, json=payload)
             except Exception:
                 pass
             # Rate limiting: ~25 msg/sec (stay under Telegram's 30/sec limit)
             if i > 0 and i % 20 == 0:
                 await asyncio.sleep(1)
+
+# Message-effect ids — LIVE-VERIFIED against the Bot API (2026-08-22) and
+# confirmed FREE (no Telegram Premium required on the recipient). Do NOT swap
+# in prettier effects without re-testing: many are premium-gated for the
+# recipient (PREMIUM_ACCOUNT_REQUIRED) and full id list:
+# https://gist.github.com/wiz0u/2a6d40c8f635687be363d72251a264da
+MSG_EFFECT_CONFETTI = "5046509860389126442"   # 🎉 confetti — new service delivered
+MSG_EFFECT_FIRE = "5104841245755180586"       # 🔥 fire — renewal done
 
 @celery_app.task
 def broadcast_message(admin_id: int, text: str):
@@ -832,7 +861,7 @@ def provision_new(self, invoice_id: int, inbound_ids: list):
                  f"⏳ مدت: {duration_days} روز\n"
                  f"📶 حجم: {traffic_gb} GB\n"
                  f"{link_text}\n\n"
-                 f"🌟 از اعتماد شما سپاسگزاریم!")
+                 f"🌟 از اعتماد شما سپاسگزاریم!", MSG_EFFECT_CONFETTI)
             ]
             admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
             for aid in admin_ids:
@@ -903,12 +932,12 @@ def provision_renew(self, invoice_id: int, email: str):
             sub_link = await get_sub_link(email)
             link_text = f"\n\n🔗 <b>لینک اتصال شما:</b>\n<code>{sub_link}</code>" if sub_link else "\n\n⚠️ لینک اتصال هنوز تنظیم نشده است. لطفاً به منوی سرویس‌های من مراجعه کنید."
             notifications = referral_notifications + [
-                (user_id, 
+                (user_id,
                  f"🔄 <b>سرویس شما برای <code>{email}</code> با موفقیت تمدید شد!</b>\n\n"
                  f"📦 پلن: {plan_name}\n"
                  f"⏳ مدت: {duration_days} روز\n"
                  f"📶 حجم: {traffic_gb} GB\n"
-                 f"{link_text}")
+                 f"{link_text}", MSG_EFFECT_FIRE)
             ]
             admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
             for aid in admin_ids:
@@ -1465,4 +1494,616 @@ def reconcile_client_names(admin_id: int, user_filter: str = None):
             await notify_user_with_buttons(admin_id, text, kb)
         else:
             await notify_user(admin_id, header + "\n\n✅ موردی برای تعمیر یافت نشد.")
+    run_async(_run())
+
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def provision_reseller_extend(self, invoice_id: int):
+    """Extend an owned reseller service without changing or resetting traffic."""
+    async def _run():
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if not invoice:
+                return
+            reseller_id = invoice.reseller_id
+            email = invoice.client_name
+            try:
+                days = int(json.loads(invoice.description or '{}').get('days', 0))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                days = 0
+            owns_service = db.query(Invoice.id).filter(
+                Invoice.reseller_id == reseller_id,
+                Invoice.client_name == email,
+                Invoice.status == 'COMPLETE'
+            ).first() is not None
+        if not reseller_id or not email or days <= 0 or not owns_service:
+            _refund_reseller(invoice_id)
+            return
+        try:
+            xui = XUIClient()
+            full_client_response = await xui.get_client_full(email)
+            client_payload = full_client_response.get('client', {})
+            if not client_payload:
+                raise ValueError(f"Client not found: {email}")
+            now_ms = int(time.time() * 1000)
+            current_expiry = client_payload.get('expiryTime', 0)
+            expiry_base = max(now_ms, current_expiry) if current_expiry > 0 else now_ms
+            update_payload = {
+                "email": email,
+                "totalGB": client_payload.get('totalGB', 0),
+                "expiryTime": expiry_base + (days * 86400 * 1000),
+                "tgId": client_payload.get('tgId', 0),
+                "enable": client_payload.get('enable', True)
+            }
+            await xui.update_client(email, update_payload)
+            await invalidate_cache(reseller_id)
+            with SessionLocal() as db:
+                inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                inv.status = "COMPLETE"
+                db.commit()
+            await notify_user(reseller_id, f"⏳ <b>{days} روز به سرویس <code>{email}</code> اضافه شد.</b>")
+        except Exception as e:
+            if self.request.retries >= self.max_retries:
+                _refund_reseller(invoice_id)
+                await notify_user(reseller_id, "❌ <b>افزایش مدت سرویس ناموفق بود.</b>")
+                logging.error(f"Reseller extend failed after {self.max_retries} retries: {e}")
+            else:
+                logging.warning(f"Reseller extend attempt {self.request.retries+1} failed: {e}")
+            raise
+    run_async(_run())
+
+
+# ===================== Amnezia service tasks =====================
+# Quota/expiry live on the PANEL USER (shared by all of a user's Amnezia
+# connections); traffic_limit is sent in whole GB, read back in bytes.
+# The chosen server for AMNEZIA_NEW rides in invoice.description JSON
+# ({"server_id": N}) — same pattern provision_reseller_extend uses for days.
+
+async def send_user_document(tg_id: int, filename: str, content: bytes, caption: str):
+    bot_token = os.getenv('BOT_TOKEN')
+    if not bot_token:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        files = {"document": (filename, content, "application/octet-stream")}
+        data = {"chat_id": str(tg_id), "caption": caption, "parse_mode": "HTML"}
+        try:
+            await client.post(url, data=data, files=files)
+        except Exception:
+            pass
+
+
+def _invoice_server_id(description: str):
+    """Extract {"server_id": N} from an invoice description JSON (None if absent)."""
+    try:
+        return int(json.loads(description or '{}').get('server_id'))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _invoice_amnezia_creds(description: str) -> tuple:
+    """(username, password) the user chose for their Amnezia panel account,
+    stored in the invoice description JSON. Either may be None."""
+    try:
+        d = json.loads(description or '{}')
+    except (TypeError, json.JSONDecodeError):
+        return None, None
+    username = d.get('amz_username') if isinstance(d.get('amz_username'), str) else None
+    password = d.get('amz_password') if isinstance(d.get('amz_password'), str) else None
+    return username, password
+
+
+def _get_amnezia_mapping(db, telegram_id: int):
+    """Legacy 1:1 mapping lookup — kept only for reference/migration tooling."""
+    from database import AmneziaUser
+    return db.query(AmneziaUser).filter(AmneziaUser.telegram_user_id == telegram_id).first()
+
+
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def provision_amnezia_new(self, invoice_id: int):
+    async def _run():
+        try:
+            with SessionLocal() as db:
+                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                if not invoice or invoice.status == "COMPLETE":
+                    return
+                plan = db.query(Plan).filter(Plan.id == invoice.plan_id).first()
+                if not plan:
+                    invoice.status = "FAILED"
+                    db.commit()
+                    await notify_user(invoice.telegram_user_id, "❌ پلن مربوطه یافت نشد. لطفاً با پشتیبانی تماس بگیرید.")
+                    return
+                user_id = invoice.telegram_user_id
+                wanted_server = _invoice_server_id(invoice.description)
+                amz_username, amz_password = _invoice_amnezia_creds(invoice.description)
+                # Idempotency: a retry after a partial failure must not create a
+                # second account or connection — reuse the service row from the
+                # first attempt.
+                existing = db.query(AmneziaService).filter(
+                    AmneziaService.invoice_id == invoice_id,
+                    AmneziaService.status == 'active').first()
+                existing_conn = existing.connection_id if existing else None
+                existing_client = existing.client_id if existing else None
+                existing_server = existing.server_id if existing else None
+                existing_name = existing.name if existing else None
+                existing_acct = ({"panel_user_id": existing.panel_user_id,
+                                  "username": existing.panel_username,
+                                  "password": existing.panel_password}
+                                 if existing and existing.panel_user_id else None)
+
+            amz = AmneziaClient()
+            try:
+                acct = existing_acct or await amz.ensure_service_account(
+                    user_id, base_username=amz_username, password=amz_password,
+                    invoice_id=invoice_id)
+                if existing_conn:
+                    created = {"connection_id": existing_conn, "client_id": existing_client,
+                               "server_id": existing_server, "protocol": amz.protocol,
+                               "name": existing_name, "server_name": None,
+                               "config": None, "vpn_link": None}
+                else:
+                    servers = await amz.list_servers()
+                    if not servers:
+                        raise RuntimeError("no Amnezia servers discovered")
+                    valid_ids = {s['id'] for s in servers}
+                    server_id = wanted_server if wanted_server in valid_ids else servers[0]['id']
+                    conn_name = f"amz_{user_id}_{invoice_id}"
+                    created = await amz.add_connection(acct["panel_user_id"], server_id, conn_name)
+                    created["name"] = conn_name
+
+                now = datetime.now(timezone.utc)
+                expiry = now + timedelta(days=plan.duration_days)
+                await amz.update_user_limits(acct["panel_user_id"], user_id,
+                                             quota_gb=plan.traffic_gb, expiry=expiry)
+
+                with SessionLocal() as db:
+                    svc = db.query(AmneziaService).filter(
+                        AmneziaService.connection_id == created['connection_id']).first()
+                    if svc is None:
+                        svc = AmneziaService(
+                            telegram_user_id=user_id,
+                            connection_id=created['connection_id'],
+                            client_id=created['client_id'],
+                            server_id=created['server_id'],
+                            server_name=created.get('server_name'),
+                            protocol=created.get('protocol') or amz.protocol,
+                            name=created.get('name') or f"amz_{user_id}_{invoice_id}",
+                            quota_bytes=plan.traffic_gb * 1024 ** 3,
+                            expiry_date=expiry,
+                            status='active',
+                            invoice_id=invoice_id,
+                            panel_user_id=acct["panel_user_id"],
+                            panel_username=acct["username"],
+                            panel_password=acct["password"],
+                        )
+                        db.add(svc)
+                        db.flush()
+                    else:
+                        svc.status = 'active'
+                        svc.quota_bytes = plan.traffic_gb * 1024 ** 3
+                        svc.expiry_date = expiry
+                        svc.panel_user_id = acct["panel_user_id"]
+                        svc.panel_username = acct["username"]
+                        svc.panel_password = acct["password"]
+                        if created.get('server_name'):
+                            svc.server_name = created['server_name']
+                    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                    if invoice:
+                        invoice.status = "COMPLETE"
+                        invoice.amnezia_service_id = svc.id
+                        invoice.client_name = svc.name
+                    db.commit()
+                    service_id = svc.id
+
+                await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
+                                              "✅ <b>سرویس Amnezia شما با موفقیت ایجاد شد!</b>")
+
+                referral_notifications = mark_referral_paid(user_id)
+
+                # Deliver the fresh config from the panel (a retry has none stored).
+                cfg = await amz.get_connection_config(created['server_id'], created['client_id'])
+                vpn_link = cfg.get('vpn_link') or created.get('vpn_link')
+                config_text = cfg.get('config') or ''
+                if vpn_link:
+                    await notify_user(user_id,
+                        f"🔗 <b>لینک اتصال Amnezia:</b>\n<code>{vpn_link}</code>\n\n"
+                        f"👆 این لینک را کپی و در برنامه Amnezia وارد کنید.")
+                if config_text:
+                    await send_user_document(user_id, f"{created.get('name') or 'amnezia'}.conf",
+                                             config_text.encode('utf-8'),
+                                             "📄 فایل کانفیگ سرویس Amnezia شما")
+
+                # Always show THIS subscription's panel-account credentials back
+                # to the user so they can log into the Amnezia web UI.
+                cred_lines = (
+                    f"👤 <b>نام کاربری:</b> <code>{acct['username']}</code>\n"
+                    + (f"🔑 <b>رمز عبور:</b> <code>{acct['password']}</code>"
+                       if acct.get('password') else
+                       "🔑 رمز عبور: <i>در دسترس نیست.</i>")
+                    + f"\n\n🌐 ورود به پنل وب: {os.getenv('AMNEZIA_API_URL', '').rstrip('/')}"
+                )
+                await notify_user(user_id, f"🔐 <b>مشخصات حساب Amnezia این سرویس</b>\n\n{cred_lines}")
+
+                notifications = referral_notifications + [
+                    (user_id,
+                     f"🎉 <b>سرویس Amnezia شما فعال شد!</b>\n\n"
+                     f"🔖 نام سرویس: <code>{created.get('name')}</code>\n"
+                     f"📦 حجم: {plan.traffic_gb} GB\n"
+                     f"⏳ مدت: {plan.duration_days} روز\n\n"
+                     f"🌟 برای مشاهده لینک و کانفیگ، به منوی «📦 مدیریت سرویس‌های من» مراجعه کنید.",
+                     MSG_EFFECT_CONFETTI)
+                ]
+                admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+                for aid in admin_ids:
+                    notifications.append((aid,
+                        f"✅ <b>سرویس Amnezia جدید ایجاد شد</b>\n\n"
+                        f"👤 <b>شناسه کاربر:</b> <code>{user_id}</code>\n"
+                        f"📦 <b>پلن:</b> {plan.name}\n"
+                        f"🖥 <b>سرور:</b> {created.get('server_name') or created['server_id']}\n"
+                        f"🔗 <b>سرویس:</b> <code>{created.get('name')}</code>\n"
+                        f"📄 <b>شماره فاکتور:</b> #{invoice_id}"))
+                await notify_many_users(notifications)
+            finally:
+                await amz.close()
+        except Exception as e:
+            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
+                                          f"❌ <b>خطا در ساخت سرویس Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+            raise
+    run_async(_run())
+
+
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def provision_amnezia_renew(self, invoice_id: int):
+    """Renew: unused traffic carries over, plan GB is added, expiry extends."""
+    async def _run():
+        try:
+            with SessionLocal() as db:
+                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                if not invoice or invoice.status == "COMPLETE":
+                    return
+                plan = db.query(Plan).filter(Plan.id == invoice.plan_id).first()
+                svc = db.query(AmneziaService).filter(
+                    AmneziaService.id == invoice.amnezia_service_id).first()
+                if not plan or not svc:
+                    invoice.status = "FAILED"
+                    db.commit()
+                    await notify_user(invoice.telegram_user_id, "❌ سرویس یا پلن مربوطه یافت نشد.")
+                    return
+                user_id = invoice.telegram_user_id
+                service_id = svc.id
+                panel_user_id, panel_username = svc.panel_user_id, svc.panel_username
+
+            amz = AmneziaClient()
+            try:
+                if not panel_user_id or not panel_username:
+                    raise RuntimeError(f"service {service_id} has no dedicated panel account")
+                stats = await amz.get_user_stats(panel_username)
+                if stats is None:
+                    raise RuntimeError(f"panel user {panel_username} not found")
+                now = datetime.now(timezone.utc)
+                remaining_gb = max(0, round((stats['limit'] - stats['used']) / (1024 ** 3)))
+                new_limit_gb = remaining_gb + plan.traffic_gb
+                current_exp = stats['expiration_date']
+                base = max(now, current_exp) if current_exp else now
+                new_exp = base + timedelta(days=plan.duration_days)
+                await amz.update_user_limits(panel_user_id, user_id,
+                                             quota_gb=new_limit_gb, expiry=new_exp)
+                with SessionLocal() as db:
+                    svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
+                    if svc:
+                        svc.quota_bytes = new_limit_gb * 1024 ** 3
+                        svc.expiry_date = new_exp
+                        svc.status = 'active'
+                        svc.expiry_warned_at = None
+                    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                    if invoice:
+                        invoice.status = "COMPLETE"
+                    db.commit()
+                await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
+                                              f"🔄 <b>تمدید سرویس Amnezia با موفقیت انجام شد!</b> 🌟")
+                referral_notifications = mark_referral_paid(user_id)
+                notifications = referral_notifications + [
+                    (user_id,
+                     f"🔄 <b>سرویس Amnezia شما تمدید شد!</b>\n\n"
+                     f"📦 حجم افزوده‌شده: {plan.traffic_gb} GB\n"
+                     f"⏳ مدت افزوده‌شده: {plan.duration_days} روز\n"
+                     f"📅 انقضای جدید: {new_exp.strftime('%Y-%m-%d')}",
+                     MSG_EFFECT_FIRE)
+                ]
+                admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+                for aid in admin_ids:
+                    notifications.append((aid,
+                        f"✅ <b>تمدید Amnezia انجام شد</b>\n👤 <code>{user_id}</code> | 📦 {plan.name} | 📄 #{invoice_id}"))
+                await notify_many_users(notifications)
+            finally:
+                await amz.close()
+        except Exception as e:
+            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
+                                          f"❌ <b>خطا در تمدید سرویس Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+            raise
+    run_async(_run())
+
+
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def provision_amnezia_topup(self, invoice_id: int):
+    """Top-up: adds volume only; expiry and remaining traffic are untouched."""
+    async def _run():
+        try:
+            with SessionLocal() as db:
+                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                if not invoice or invoice.status == "COMPLETE":
+                    return
+                svc = db.query(AmneziaService).filter(
+                    AmneziaService.id == invoice.amnezia_service_id).first()
+                if not svc:
+                    invoice.status = "FAILED"
+                    db.commit()
+                    await notify_user(invoice.telegram_user_id, "❌ سرویس مربوطه یافت نشد.")
+                    return
+                if (svc.quota_bytes or 0) == 0:
+                    # Unlimited service: topping up would CAP the account-wide
+                    # panel quota to the purchased GB. Refuse and refund nothing
+                    # (invoice stays PENDING for admin review).
+                    invoice.status = "NEEDS_REVIEW"
+                    db.commit()
+                    await notify_user(invoice.telegram_user_id,
+                        "♾️ این سرویس نامحدود است؛ خرید حجم اضافه روی آن امکان‌پذیر نیست. "
+                        "لطفاً با پشتیبانی تماس بگیرید.")
+                    return
+                user_id = invoice.telegram_user_id
+                added_gb = invoice.added_gb or 0
+                service_id = svc.id
+                panel_user_id, panel_username = svc.panel_user_id, svc.panel_username
+
+            amz = AmneziaClient()
+            try:
+                if not panel_user_id or not panel_username:
+                    raise RuntimeError(f"service {service_id} has no dedicated panel account")
+                stats = await amz.get_user_stats(panel_username)
+                if stats is None:
+                    raise RuntimeError(f"panel user {panel_username} not found")
+                current_limit_gb = round(stats['limit'] / (1024 ** 3))
+                new_limit_gb = current_limit_gb + added_gb
+                await amz.update_user_limits(panel_user_id, user_id,
+                                             quota_gb=new_limit_gb)
+                with SessionLocal() as db:
+                    svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
+                    if svc:
+                        svc.quota_bytes = new_limit_gb * 1024 ** 3
+                        svc.status = 'active'
+                    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                    if invoice:
+                        invoice.status = "COMPLETE"
+                    db.commit()
+                await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
+                                              f"➕ <b>{added_gb} گیگابایت با موفقیت به سرویس Amnezia شما اضافه شد!</b> 🎉")
+                referral_notifications = mark_referral_paid(user_id)
+                notifications = referral_notifications + [
+                    (user_id, f"➕ <b>{added_gb} گیگابایت به سرویس Amnezia شما اضافه شد!</b>")
+                ]
+                admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+                for aid in admin_ids:
+                    notifications.append((aid,
+                        f"✅ <b>خرید حجم Amnezia انجام شد</b> ({added_gb}GB) برای <code>{user_id}</code> | 📄 #{invoice_id}"))
+                await notify_many_users(notifications)
+            finally:
+                await amz.close()
+        except Exception as e:
+            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
+                                          f"❌ <b>خطا در افزودن حجم Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+            raise
+    run_async(_run())
+
+
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+def delete_amnezia_service(self, service_id: int):
+    """Remove an Amnezia connection from the panel and mark the local row deleted."""
+    async def _run():
+        with SessionLocal() as db:
+            svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
+            if not svc or svc.status == 'deleted':
+                return
+            user_id = svc.telegram_user_id
+            server_id = svc.server_id
+            client_id = svc.client_id
+            name = svc.name
+            panel_user_id = svc.panel_user_id
+        try:
+            amz = AmneziaClient()
+            try:
+                if panel_user_id:
+                    # Dedicated per-service account: deleting it cascades the
+                    # connection too (panel-verified behaviour).
+                    await amz.delete_panel_user(panel_user_id)
+                else:
+                    await amz.remove_connection(server_id, client_id)
+            finally:
+                await amz.close()
+            with SessionLocal() as db:
+                svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
+                if svc:
+                    svc.status = 'deleted'
+                    db.commit()
+            await notify_user(user_id,
+                f"🗑 <b>سرویس Amnezia <code>{name}</code> حذف شد.</b>\n\nسرویس غیرفعال شد و دیگر قابل استفاده نیست.")
+        except Exception as e:
+            logging.error(f"Amnezia service deletion failed (service {service_id}): {e}")
+            raise
+    run_async(_run())
+
+
+@celery_app.task
+def check_amnezia_expiry():
+    """Daily Amnezia expiry sweep: warn once ≤3 days before expiry; on expiry
+    disable the service's OWN panel account, mark it expired and notify.
+
+    Each subscription has a dedicated panel account, so disabling one service
+    never touches the buyer's other services.
+    """
+    async def _run():
+        now = datetime.now(timezone.utc)
+        amz = AmneziaClient()
+        try:
+            notifications = []
+            with SessionLocal() as db:
+                services = db.query(AmneziaService).filter(
+                    AmneziaService.status == 'active').all()
+                for svc in services:
+                    try:
+                        if not svc.panel_user_id or not svc.panel_username:
+                            continue
+                        stats = await amz.get_user_stats(svc.panel_username)
+                        exp = (stats or {}).get('expiration_date') or svc.expiry_date
+                        if not exp:
+                            continue
+                        days_left = (exp - now).days
+                        if exp <= now:
+                            await amz.set_user_enabled(svc.panel_user_id, enabled=False)
+                            svc.status = 'expired'
+                            notifications.append((svc.telegram_user_id,
+                                f"⌛ <b>سرویس Amnezia شما منقضی شد.</b>\n\n"
+                                f"🔖 سرویس: <code>{svc.name}</code>\n"
+                                f"برای ادامه استفاده، از منوی خرید تمدید کنید."))
+                        elif days_left <= 3 and (
+                                svc.expiry_warned_at is None or
+                                now - svc.expiry_warned_at > timedelta(hours=20)):
+                            svc.expiry_warned_at = now
+                            notifications.append((svc.telegram_user_id,
+                                f"⚠️ <b>هشدار اتمام سرویس Amnezia</b>\n"
+                                f"━━━━━━━━━━━━━━\n"
+                                f"🔖 سرویس: <code>{svc.name}</code>\n"
+                                f"📅 {days_left} روز تا انقضا\n\n"
+                                f"جهت جلوگیری از قطعی، لطفاً تمدید یا خرید حجم انجام دهید."))
+                    except Exception as e:
+                        logging.error(f"check_amnezia_expiry error for service {svc.id}: {e}")
+                        continue
+                db.commit()
+            if notifications:
+                await notify_many_users(notifications)
+        finally:
+            await amz.close()
+    run_async(_run())
+
+
+@celery_app.task
+def check_amnezia_servers():
+    """Hourly Amnezia server health sweep.
+
+    Panel server ids are LIST INDEXES — deleting OR REORDERING servers shifts
+    every later index silently (confirmed in the panel's own source). The
+    connection record fetched fresh from the panel is authoritative for both
+    its current ``server_id`` and ``server_name``, so each service is
+    re-anchored whenever either differs:
+
+      1. connection vanished from the panel -> notify owner,
+      2. stored (id, name) != current (id, name):
+           - name changed  -> physical move: re-anchor AND notify the owner,
+           - id-only shift -> pure reorder: re-anchor SILENTLY,
+      3. ping the (corrected) server: down/deleted -> notify once per episode;
+         back alive -> "back online" notice and clear the flag.
+
+    All (id, name) pairs observed this run also rewrite the shared Redis name
+    cache, so the picker never shows post-reorder stale names for long.
+    """
+    async def _run():
+        now = datetime.now(timezone.utc)
+        amz = AmneziaClient()
+        try:
+            try:
+                servers = await amz.list_servers(force_refresh=True)
+            except AmneziaError as e:
+                logging.error(f"check_amnezia_servers: cannot list servers: {e}")
+                return
+            alive_by_id = {s['id']: s.get('alive', True) for s in servers}
+            observed_server_names = {}
+
+            notifications = []
+            with SessionLocal() as db:
+                services = db.query(AmneziaService).filter(
+                    AmneziaService.status == 'active').all()
+
+                for svc in services:
+                    try:
+                        if not svc.panel_user_id:
+                            continue
+                        try:
+                            conns = await amz.get_user_connections(svc.panel_user_id)
+                        except AmneziaError as e:
+                            logging.error(f"check_amnezia_servers: connections fetch failed "
+                                          f"for service {svc.id} account {svc.panel_username}: {e}")
+                            continue
+                        tg_id = svc.telegram_user_id
+                        conns_by_id = {c.get('id'): c for c in conns}
+
+                        conn = conns_by_id.get(svc.connection_id)
+
+                        # 1) Connection vanished from the panel entirely.
+                        if conn is None:
+                            if (not svc.server_missing_notified_at or
+                                    now - svc.server_missing_notified_at > timedelta(hours=24)):
+                                svc.server_missing_notified_at = now
+                                notifications.append((tg_id,
+                                    f"⚠️ <b>سرویس Amnezia شما در پنل یافت نشد.</b>\n\n"
+                                    f"🔖 سرویس: <code>{svc.name}</code>\n"
+                                    f"این سرویس از پنل حذف شده است. لطفاً با پشتیبانی تماس بگیرید."))
+                            continue
+
+                        # Remember every (id, name) pair seen live this run.
+                        if conn.get('server_name'):
+                            observed_server_names[conn.get('server_id')] = conn['server_name']
+
+                        # 2) Re-anchor from the panel's own record.
+                        cur_sid = conn.get('server_id')
+                        cur_name = conn.get('server_name')
+                        id_changed = cur_sid is not None and cur_sid != svc.server_id
+                        name_changed = bool(cur_name and svc.server_name and
+                                            cur_name != svc.server_name)
+                        if id_changed:
+                            old_sid = svc.server_id
+                            svc.server_id = cur_sid
+                            logging.info(f"check_amnezia_servers: service {svc.id} "
+                                         f"re-anchored {old_sid} -> {cur_sid} "
+                                         f"({'move' if name_changed else 'reorder'})")
+                        if name_changed:
+                            old_name = svc.server_name
+                            svc.server_name = cur_name
+                            notifications.append((tg_id,
+                                f"ℹ️ <b>سرور سرویس Amnezia شما تغییر کرد</b>\n\n"
+                                f"🔖 سرویس: <code>{svc.name}</code>\n"
+                                f"🖥 {old_name} ← اکنون روی <b>{cur_name}</b>"))
+                        elif id_changed and not svc.server_name and cur_name:
+                            svc.server_name = cur_name
+
+                        sid = svc.server_id
+                        label = svc.server_name or f"سرور {sid}"
+                        alive = alive_by_id.get(sid)
+
+                        # 3) Reachability (None = server not in panel list anymore).
+                        if alive is None or alive is False:
+                            if (not svc.server_missing_notified_at or
+                                    now - svc.server_missing_notified_at > timedelta(hours=24)):
+                                svc.server_missing_notified_at = now
+                                reason = ("حذف شده" if alive is None else "در دسترس نیست")
+                                notifications.append((tg_id,
+                                    f"🚨 <b>سرور سرویس Amnezia شما {reason} است!</b>\n\n"
+                                    f"🔖 سرویس: <code>{svc.name}</code>\n"
+                                    f"🖥 سرور: <b>{label}</b>\n\n"
+                                    f"تا رفع مشکل، این سرویس کار نخواهد کرد. برای انتقال به سرور دیگر با پشتیبانی تماس بگیرید."))
+                        elif svc.server_missing_notified_at:
+                            svc.server_missing_notified_at = None
+                            notifications.append((tg_id,
+                                f"✅ <b>سرور سرویس Amnezia شما دوباره آنلاین شد.</b>\n\n"
+                                f"🔖 سرویس: <code>{svc.name}</code>\n"
+                                f"🖥 سرور: <b>{label}</b>"))
+                    except Exception as e:
+                        logging.error(f"check_amnezia_servers error for service {svc.id}: {e}")
+                        continue
+                db.commit()
+            # Rewrite the shared name cache from live records so picker labels
+            # heal after any reorder/rename within one sweep.
+            if observed_server_names:
+                await amz.replace_server_names(observed_server_names)
+            if notifications:
+                await notify_many_users(notifications)
+        finally:
+            await amz.close()
     run_async(_run())

@@ -36,6 +36,15 @@ DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///storage/bot.db')
 PANEL_SSL_VERIFY = os.getenv('PANEL_SSL_VERIFY', 'false').lower() == 'true'
 SKIP_DB_INIT = os.getenv('SKIP_DB_INIT', 'false').lower() == 'true'
 
+# ========== Amnezia Web Panel ==========
+AMNEZIA_API_URL = os.getenv('AMNEZIA_API_URL', '').rstrip('/')
+AMNEZIA_API_USERNAME = os.getenv('AMNEZIA_API_USERNAME', '')
+AMNEZIA_API_PASSWORD = os.getenv('AMNEZIA_API_PASSWORD', '')
+AMNEZIA_PROTOCOL = os.getenv('AMNEZIA_PROTOCOL', 'awg2')
+AMNEZIA_ENABLED = os.getenv('AMNEZIA_ENABLED', 'false').lower() == 'true'
+# When AMNEZIA_ENABLED is false only admins see/use Amnezia features.
+AMNEZIA_AVAILABLE = bool(AMNEZIA_API_URL and AMNEZIA_API_USERNAME and AMNEZIA_API_PASSWORD)
+
 
 def get_admin_ids() -> List[int]:
     """Return list of admin Telegram user IDs from environment."""
@@ -45,6 +54,15 @@ def get_admin_ids() -> List[int]:
 def is_admin(user_id: int) -> bool:
     """Check if a user ID is in the admin list."""
     return user_id in get_admin_ids()
+
+
+def amnezia_visible(user_id: int) -> bool:
+    """True if Amnezia options should be shown to this user.
+
+    Requires the integration to be configured; when AMNEZIA_ENABLED is off
+    (experimental mode) only admins may see it.
+    """
+    return AMNEZIA_AVAILABLE and (AMNEZIA_ENABLED or is_admin(user_id))
 
 
 # ========== Database Session ==========
@@ -63,7 +81,13 @@ __all__ = [
     'DATABASE_URL',
     'PANEL_SSL_VERIFY',
     'SKIP_DB_INIT',
+    'AMNEZIA_API_URL',
+    'AMNEZIA_API_USERNAME',
+    'AMNEZIA_API_PASSWORD',
+    'AMNEZIA_PROTOCOL',
+    'AMNEZIA_ENABLED',
     'get_admin_ids',
     'is_admin',
+    'amnezia_visible',
     'SessionLocal',
 ]

@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-from ..config import get_admin_ids
+from ..config import get_admin_ids, amnezia_visible
 from ..services.reseller import is_reseller
 
 
@@ -40,6 +40,8 @@ def get_main_menu(user_id: int):
             KeyboardButton(text="🎧 پشتیبانی"),
         ],
     ]
+    if amnezia_visible(user_id):
+        buttons.insert(1, [KeyboardButton(text="🟣 خرید Amnezia")])
     if user_id in get_admin_ids():
         buttons.append([KeyboardButton(text="⚙️ پنل مدیریت")])
     if is_reseller(user_id):
@@ -48,52 +50,87 @@ def get_main_menu(user_id: int):
 
 
 def get_admin_menu():
+    """Top-level admin panel: category launcher buttons only.
+
+    Every actual action lives one level deeper (see ``get_admin_category_kb``)
+    with its callback unchanged, so reorganizing never touches handlers.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 داشبورد", callback_data="admin_dashboard")],
-            [InlineKeyboardButton(text="🎯 انتخاب سرور اصلی", callback_data="admin_select_inbound")],
-            [InlineKeyboardButton(text="🖥 وضعیت سرور", callback_data="admin_sys_status")],
+            [InlineKeyboardButton(text="📊 داشبورد و وضعیت", callback_data="admcat_dash")],
+            [InlineKeyboardButton(text="🛍 پلن‌ها و فروش", callback_data="admcat_plans")],
+            [InlineKeyboardButton(text="🧾 فاکتور و پرداخت", callback_data="admcat_invoices")],
+            [InlineKeyboardButton(text="👥 کاربران و نمایندگان", callback_data="admcat_users")],
             [
-                InlineKeyboardButton(text="👤 مدیریت کاربر", callback_data="admin_manage_user"),
-                InlineKeyboardButton(text="🗑 پاکسازی منقضی‌ها", callback_data="admin_del_depleted"),
+                InlineKeyboardButton(text="🟣 Amnezia", callback_data="admcat_amnezia"),
+                InlineKeyboardButton(text="🌐 تنظیمات", callback_data="admcat_settings"),
             ],
-            [
-                InlineKeyboardButton(text="💾 بکاپ به تلگرام", callback_data="admin_backup_tg"),
-                InlineKeyboardButton(text="🔄 پنیک/ری‌استارت", callback_data="admin_restart_menu"),
-            ],
-            [
-                InlineKeyboardButton(text="➕ افزودن پلن", callback_data="admin_add_plan"),
-                InlineKeyboardButton(text="📋 لیست پلن‌ها", callback_data="admin_view_plans"),
-            ],
-            [InlineKeyboardButton(text="🎫 کدهای تخفیف", callback_data="admin_coupon_menu")],
-            [InlineKeyboardButton(text="🎁 تنظیمات تست رایگان", callback_data="admin_trial_settings")],
-            [InlineKeyboardButton(text="🤝 تنظیمات معرفی", callback_data="admin_referral_settings")],
-            [InlineKeyboardButton(text="🧑‍💼 مدیریت نمایندگان", callback_data="admin_reseller_menu")],
-            [InlineKeyboardButton(text="📦 مدیریت بسته‌های ترافیک", callback_data="admin_traffic_packs")],
-            [InlineKeyboardButton(text="📊 گزارش فروش", callback_data="admin_billing_report")],
-            [InlineKeyboardButton(text="📨 صدور رسید سفارشی", callback_data="admin_custom_receipt")],
-            [InlineKeyboardButton(text="📋 رسیدهای تایید شده", callback_data="admin_approved_receipts")],
-            [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="admin_broadcast")],
-            [
-                InlineKeyboardButton(text="💳 کارت پرداخت", callback_data="admin_set_card"),
-                InlineKeyboardButton(text="🔗 لینک ساب", callback_data="admin_set_sub_link"),
-                InlineKeyboardButton(text="👤 حساب پشتیبانی", callback_data="admin_set_support"),
-            ],
-            [
-                InlineKeyboardButton(text="🔄 بازبینی فاکتورها", callback_data="admin_retry_invoices"),
-            ],
-            [
-                InlineKeyboardButton(text="🔧 تعمیر سرویس‌های نامرئی", callback_data="admin_reconcile_names"),
-                InlineKeyboardButton(text="👤 تعمیر یک کاربر", callback_data="admin_reconcile_user"),
-            ],
-            [InlineKeyboardButton(text="📥 همگام‌سازی گروه پنل", callback_data="admin_sync_group")],
-            [
-                InlineKeyboardButton(text="📊 مصرف روزانه پنل", callback_data="admin_panel_traffic"),
-                InlineKeyboardButton(text="🔄 جمع‌آوری دستی", callback_data="admin_force_traffic")
-            ],
+            [InlineKeyboardButton(text="🔧 تعمیر و نگهداری", callback_data="admcat_maint")],
             [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu")]
         ]
     )
+
+
+# Category -> (title, [(text, callback), ...]) — callbacks MUST stay identical
+# to the pre-reorganization ones; only the grouping is new.
+ADMIN_CATEGORIES = {
+    "admcat_dash": ("📊 داشبورد و وضعیت", [
+        ("📊 داشبورد", "admin_dashboard"),
+        ("🖥 وضعیت سرور", "admin_sys_status"),
+        ("🎯 انتخاب سرور اصلی", "admin_select_inbound"),
+        ("📊 مصرف روزانه پنل", "admin_panel_traffic"),
+        ("🔄 جمع‌آوری دستی ترافیک", "admin_force_traffic"),
+    ]),
+    "admcat_plans": ("🛍 پلن‌ها و فروش", [
+        ("➕ افزودن پلن", "admin_add_plan"),
+        ("🟣 افزودن پلن Amnezia", "admin_add_plan_amz"),
+        ("📋 لیست پلن‌ها", "admin_view_plans"),
+        ("📦 مدیریت بسته‌های ترافیک", "admin_traffic_packs"),
+        ("🎫 کدهای تخفیف", "admin_coupon_menu"),
+        ("🎁 تنظیمات تست رایگان", "admin_trial_settings"),
+        ("🤝 تنظیمات معرفی", "admin_referral_settings"),
+    ]),
+    "admcat_invoices": ("🧾 فاکتور و پرداخت", [
+        ("🔄 بازبینی فاکتورها", "admin_retry_invoices"),
+        ("📋 رسیدهای تایید شده", "admin_approved_receipts"),
+        ("📨 صدور رسید سفارشی", "admin_custom_receipt"),
+        ("📊 گزارش فروش", "admin_billing_report"),
+        ("💳 کارت پرداخت", "admin_set_card"),
+    ]),
+    "admcat_users": ("👥 کاربران و نمایندگان", [
+        ("👤 مدیریت کاربر", "admin_manage_user"),
+        ("🗑 پاکسازی منقضی‌ها", "admin_del_depleted"),
+        ("🧑‍💼 مدیریت نمایندگان", "admin_reseller_menu"),
+        ("📢 پیام همگانی", "admin_broadcast"),
+    ]),
+    "admcat_amnezia": ("🟣 Amnezia", [
+        ("📦 سرویس‌های Amnezia", "admin_amnezia"),
+        ("➕ افزودن پلن Amnezia", "admin_add_plan_amz"),
+    ]),
+    "admcat_maint": ("🔧 تعمیر و نگهداری", [
+        ("🔧 تعمیر سرویس‌های نامرئی", "admin_reconcile_names"),
+        ("👤 تعمیر یک کاربر", "admin_reconcile_user"),
+        ("📥 همگام‌سازی گروه پنل", "admin_sync_group"),
+        ("💾 بکاپ به تلگرام", "admin_backup_tg"),
+        ("🔄 پنیک/ری‌استارت", "admin_restart_menu"),
+    ]),
+    "admcat_settings": ("🌐 تنظیمات", [
+        ("🔗 لینک ساب", "admin_set_sub_link"),
+        ("👤 حساب پشتیبانی", "admin_set_support"),
+        ("💳 کارت پرداخت", "admin_set_card"),
+    ]),
+}
+
+
+def get_admin_category_kb(callback_data: str):
+    """Submenu keyboard for one admin category; unknown ids fall back to the
+    top-level admin panel so a stale button can never dead-end."""
+    title, items = ADMIN_CATEGORIES.get(
+        callback_data,
+        ADMIN_CATEGORIES["admcat_dash"])
+    rows = [[InlineKeyboardButton(text=text, callback_data=cb)] for text, cb in items]
+    rows.append([InlineKeyboardButton(text="⬅️ پنل مدیریت", callback_data="admin_panel")])
+    return title, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_reseller_menu():

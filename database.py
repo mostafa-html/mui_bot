@@ -44,6 +44,7 @@ class Plan(Base):
     duration_days = Column(BigInteger, nullable=False)
     price = Column(BigInteger, nullable=False)
     is_active = Column(Boolean, default=True)
+    service_type = Column(String, default='xui', nullable=False)  # 'xui' or 'amnezia'
 
 class Invoice(Base):
     __tablename__ = "invoices"
@@ -56,7 +57,7 @@ class Invoice(Base):
     discount_amount = Column(BigInteger, nullable=True)
     coupon_code = Column(String, nullable=True)
     client_name = Column(String, nullable=True)
-    action_type = Column(String, nullable=False)  # NEW, RENEW, TOPUP, TRIAL, REFERRAL_REWARD, RESELLER_NEW/RENEW/TOPUP, MANUAL_RECEIPT, RESELLER_PACK_BUY, PANEL_SYNC
+    action_type = Column(String, nullable=False)  # NEW, RENEW, TOPUP, TRIAL, REFERRAL_REWARD, RESELLER_NEW/RENEW/TOPUP/EXTEND, MANUAL_RECEIPT, RESELLER_PACK_BUY, PANEL_SYNC, AMNEZIA_NEW/RENEW/TOPUP
     screenshot_local_path = Column(String, nullable=True)
     status = Column(String, default="PENDING")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -65,6 +66,7 @@ class Invoice(Base):
     refund_data = Column(JSON, nullable=True)
     description = Column(String, nullable=True)  # optional custom receipt description
     pack_id = Column(BigInteger, nullable=True, index=True)  # for RESELLER_PACK_BUY invoices
+    amnezia_service_id = Column(BigInteger, nullable=True, index=True)  # for AMNEZIA_RENEW/TOPUP invoices
     # Deletion tracking fields
     deletion_scheduled_at = Column(DateTime(timezone=True), nullable=True)  # When service scheduled for deletion (7 days after expiry)
     deletion_warning_sent_count = Column(Integer, default=0, nullable=False, server_default='0')  # Number of warning messages sent (max 3)
@@ -152,6 +154,42 @@ class TrafficPack(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+class AmneziaUser(Base):
+    """Maps a Telegram user to their Amnezia panel account (one per Telegram user)."""
+    __tablename__ = "amnezia_users"
+    telegram_user_id = Column(BigInteger, primary_key=True, index=True)
+    panel_user_id = Column(String(64), unique=True, nullable=False, index=True)  # UUID from panel
+    username = Column(String(64), unique=True, nullable=False, index=True)       # panel username
+    panel_password = Column(String(128), nullable=True)  # kept so the bot can show it back (panel web-UI login)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class AmneziaService(Base):
+    """One Amnezia connection (subscription) owned by a Telegram user."""
+    __tablename__ = "amnezia_services"
+    id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    telegram_user_id = Column(BigInteger, index=True, nullable=False)
+    connection_id = Column(String(64), unique=True, nullable=False, index=True)  # UUID from panel
+    client_id = Column(String(255), nullable=False)  # base64 key used for config fetch
+    server_id = Column(BigInteger, nullable=False)
+    server_name = Column(String(100), nullable=True)  # identity anchor: panel server ids are list indexes and shift on delete/reorder
+    protocol = Column(String(20), nullable=False, default='awg2')
+    name = Column(String(100), nullable=False)
+    quota_bytes = Column(BigInteger, nullable=False)          # total traffic limit (bytes)
+    expiry_date = Column(DateTime(timezone=True), nullable=False)
+    status = Column(String(20), default='active', nullable=False)  # active/expired/deleted
+    invoice_id = Column(BigInteger, nullable=True, index=True)     # creating invoice
+    # Each subscription owns a DEDICATED panel account: quota/expiry and
+    # enable/disable are panel-account-level, so isolation requires 1:1
+    # service <-> panel user (multiple purchases = multiple accounts).
+    panel_user_id = Column(String(64), nullable=True, index=True)
+    panel_username = Column(String(100), nullable=True)
+    panel_password = Column(String(128), nullable=True)  # shown back to the owner
+    expiry_warned_at = Column(DateTime(timezone=True), nullable=True)  # last warning sent (once per service)
+    server_missing_notified_at = Column(DateTime(timezone=True), nullable=True)  # set when "server down/deleted" was sent; cleared when back
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
 def run_migrations():
     """Add missing columns to existing tables (schema migrations)."""
     inspector = inspect(engine)
@@ -219,6 +257,22 @@ def run_migrations():
                 conn.execute(text("ALTER TABLE resellers ADD COLUMN inbound_ids TEXT"))
                 conn.commit()
 
+    # Plan table migrations (Amnezia service type)
+    if 'plans' in existing_tables:
+        plan_columns = [col['name'] for col in inspector.get_columns('plans')]
+        if 'service_type' not in plan_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE plans ADD COLUMN service_type VARCHAR DEFAULT 'xui' NOT NULL"))
+                conn.commit()
+
+    # Invoice table migrations (Amnezia service link)
+    if 'invoices' in existing_tables:
+        invoice_col_names = [col['name'] for col in inspector.get_columns('invoices')]
+        if 'amnezia_service_id' not in invoice_col_names:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE invoices ADD COLUMN amnezia_service_id INTEGER"))
+                conn.commit()
+
     # Create reseller_packs table if it doesn't exist (handled by create_all, but ensure any missing columns)
     # The table will be created by Base.metadata.create_all, but we add a manual creation fallback.
     if 'reseller_packs' not in existing_tables:
@@ -258,6 +312,36 @@ def run_migrations():
     # 6. coupon_usage.coupon_id – for usage counting (though foreign key may already index, we add explicitly)
     if 'coupon_usage' in existing_tables:
         create_index_if_not_exists('coupon_usage', 'idx_coupon_usage_coupon_id', ['coupon_id'])
+
+    # 7. invoices.amnezia_service_id – for renew/topup lookups
+    create_index_if_not_exists('invoices', 'idx_invoices_amnezia_service_id', ['amnezia_service_id'])
+
+    # 8. amnezia_services.telegram_user_id – for listing a user's Amnezia services
+    if 'amnezia_services' in existing_tables:
+        create_index_if_not_exists('amnezia_services', 'idx_amnezia_services_user', ['telegram_user_id'])
+        create_index_if_not_exists('amnezia_services', 'idx_amnezia_services_status', ['status'])
+        create_index_if_not_exists('amnezia_services', 'idx_amnezia_services_expiry_date', ['expiry_date'])
+        amnezia_service_columns = [col['name'] for col in inspector.get_columns('amnezia_services')]
+        for col_name, col_type in {
+            'expiry_warned_at': 'TIMESTAMP WITH TIME ZONE' if not IS_SQLITE else 'DATETIME',
+            'server_name': 'VARCHAR',
+            'server_missing_notified_at': 'TIMESTAMP WITH TIME ZONE' if not IS_SQLITE else 'DATETIME',
+            'panel_user_id': 'VARCHAR',
+            'panel_username': 'VARCHAR',
+            'panel_password': 'VARCHAR',
+        }.items():
+            if col_name not in amnezia_service_columns:
+                with engine.connect() as conn:
+                    conn.execute(text(f"ALTER TABLE amnezia_services ADD COLUMN {col_name} {col_type}"))
+                    conn.commit()
+
+    # 9. amnezia_users.panel_password – shown back to the user (panel web-UI login)
+    if 'amnezia_users' in existing_tables:
+        amnezia_user_columns = [col['name'] for col in inspector.get_columns('amnezia_users')]
+        if 'panel_password' not in amnezia_user_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE amnezia_users ADD COLUMN panel_password VARCHAR"))
+                conn.commit()
 
 def init_db():
     db = SessionLocal()

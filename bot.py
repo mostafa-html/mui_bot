@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BotCommand, BufferedInputFile
-from database import SessionLocal, Plan, Invoice, AppSetting, TrialUsage, Coupon, CouponUsage, ReferralCode, Referral, Reseller, ResellerPack, PanelTraffic, TrafficPack
+from database import SessionLocal, Plan, Invoice, AppSetting, TrialUsage, Coupon, CouponUsage, ReferralCode, Referral, Reseller, ResellerPack, PanelTraffic, TrafficPack, AmneziaUser, AmneziaService
 from sqlalchemy import func
 import redis.asyncio as redis
 from xui_client import XUIClient, get_xui_client
@@ -31,11 +31,12 @@ setup_logging(log_level=os.getenv('LOG_LEVEL', 'INFO'), log_file='logs/bot.log')
 logger = logging.getLogger(__name__)
 
 # Import config and utilities from src modules
-from src.config import BOT_TOKEN, REQUIRED_CHANNEL_ID, REQUIRED_CHANNEL_LINK, get_admin_ids
+from src.config import BOT_TOKEN, REQUIRED_CHANNEL_ID, REQUIRED_CHANNEL_LINK, get_admin_ids, amnezia_visible, AMNEZIA_ENABLED
 from src.utils.formatting import format_size, format_price, get_progress_bar, format_expiry_remaining
+from src.services.amnezia import AmneziaClient, AmneziaError, parse_expiration
 from src.utils.keyboard import (
     get_cancel_kb, get_back_kb, get_main_menu, get_admin_menu, get_reseller_menu,
-    get_join_prompt_kb, JOIN_PROMPT_TEXT
+    get_admin_category_kb, get_join_prompt_kb, JOIN_PROMPT_TEXT
 )
 from src.services.reseller import is_reseller, get_reseller_balance, reserve_reseller_allowance, reseller_owns_email, user_owns_email, GB
 from src.services.coupon import validate_coupon, calculate_discount
@@ -60,6 +61,7 @@ class BuyFlow(StatesGroup):
     wait_for_name = State()
     wait_for_coupon = State()
     wait_for_receipt = State()
+    wait_for_amz_account = State()   # optional Amnezia panel username/password
 
 class AddPlanFlow(StatesGroup):
     wait_for_name = State()
@@ -132,6 +134,7 @@ class ResellerFlow(StatesGroup):
     wait_for_gb = State()
     wait_for_topup_gb = State()
     wait_for_renew_gb = State()
+    wait_for_extend_days = State()
 
 class CustomPayFlow(StatesGroup):
     wait_for_receipt = State()
@@ -338,7 +341,16 @@ async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
 async def mm_buy_plan(message: types.Message, state: FSMContext):
     if not await check_membership(message.from_user.id):
         return await cmd_start(message)
-    text, kb = await show_plans_content(state)
+    text, kb = await show_plans_content(state, user_id=message.from_user.id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.message(F.text == "🟣 خرید Amnezia")
+async def mm_buy_amnezia(message: types.Message, state: FSMContext):
+    if not await check_membership(message.from_user.id):
+        return await cmd_start(message)
+    if not amnezia_visible(message.from_user.id):
+        return await message.answer("⛔ این بخش در دسترس شما نیست.")
+    text, kb = await show_plans_content(state, user_id=message.from_user.id, amnezia_only=True)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(F.text == "📦 سرویس‌های من")
@@ -584,41 +596,98 @@ async def trial_name(message: types.Message, state: FSMContext):
 # ==============================================================================
 # PURCHASE FLOW (NEW, RENEW, TOPUP)
 # ==============================================================================
-async def show_plans_content(state: FSMContext):
-    """Shared logic for showing plans. Returns (text, reply_markup)."""
+async def show_plans_content(state: FSMContext, user_id: int = None, amnezia_only: bool = False):
+    """Shared logic for showing plans. Returns (text, reply_markup).
+
+    Amnezia plans are listed in a separate section, visible only when
+    amnezia_visible(user_id) — i.e. everyone when AMNEZIA_ENABLED is on,
+    otherwise admins only (experimental mode). With ``amnezia_only`` the
+    listing shows ONLY the Amnezia section (dedicated 🟣 خرید Amnezia button).
+    """
     await state.update_data(action_type="NEW")
     with SessionLocal() as db:
-        plans = db.query(Plan).filter(Plan.is_active == True).all()
-    
-    if not plans:
+        q = db.query(Plan).filter(Plan.is_active == True)
+        if amnezia_only:
+            q = q.filter(Plan.service_type == 'amnezia')
+        plans = q.all()
+
+    xui_plans = [p for p in plans if (p.service_type or 'xui') != 'amnezia']
+    amnezia_plans = [p for p in plans if p.service_type == 'amnezia']
+    show_amnezia = bool(amnezia_plans) and user_id is not None and amnezia_visible(user_id)
+
+    if amnezia_only:
+        if not show_amnezia:
+            return (
+                "🟣 <b>خرید اشتراک Amnezia</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+                "⚠️ در حال حاضر هیچ پلن Amnezia فعالی موجود نیست.\n"
+                "لطفاً بعداً مراجعه کنید.",
+                get_back_kb("main_menu")
+            )
+        text = "🟣 <b>پلن‌های اشتراک Amnezia:</b>\n━━━━━━━━━━━━━━━━━━\n"
+        kb_buttons = []
+        for p in amnezia_plans:
+            gb_price = p.price / p.traffic_gb if p.traffic_gb > 0 else 0
+            size_str = "♾️ نامحدود" if (p.traffic_gb or 0) == 0 else f"{p.traffic_gb} گیگابایت"
+            text += (
+                f"\n🟣 <b>{p.name}</b>\n"
+                f"   📶 حجم: <b>{size_str}</b>\n"
+                f"   ⏳ مدت: <b>{p.duration_days} روز</b>\n"
+                f"   💰 قیمت: <b>{p.price:,} تومان</b>"
+            )
+            if gb_price > 0:
+                text += f" | <i>~{gb_price:,.0f} تومان/گیگ</i>"
+            text += "\n"
+            kb_buttons.append([InlineKeyboardButton(text=f"🟣 {p.name} — {p.price:,} تومان", callback_data=f"amzplan_{p.id}")])
+        text += "\n👇 برای خرید، یکی از پلن‌ها را انتخاب کنید:"
+        kb_buttons.append([InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")])
+        return text, InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+
+    if not xui_plans and not show_amnezia:
         return (
             "❌ <b>متأسفانه در حال حاضر هیچ پلنی موجود نیست.</b>\n\nلطفاً بعداً مراجعه کنید.",
             get_back_kb("main_menu")
         )
-    
+
     text = "🛍 <b>پلن‌های اشتراک موجود:</b>\n━━━━━━━━━━━━━━━━━━\n"
-    for i, p in enumerate(plans, 1):
+    kb_buttons = []
+    for i, p in enumerate(xui_plans, 1):
         gb_price = p.price / p.traffic_gb if p.traffic_gb > 0 else 0
+        size_str = "♾️ نامحدود" if (p.traffic_gb or 0) == 0 else f"{p.traffic_gb} گیگابایت"
         text += (
             f"\n{i}️⃣ <b>{p.name}</b>\n"
-            f"   📶 حجم: <b>{p.traffic_gb} گیگابایت</b>\n"
+            f"   📶 حجم: <b>{size_str}</b>\n"
             f"   ⏳ مدت: <b>{p.duration_days} روز</b>\n"
             f"   💰 قیمت: <b>{p.price:,} تومان</b>"
         )
         if gb_price > 0:
             text += f" | <i>~{gb_price:,.0f} تومان/گیگ</i>"
         text += "\n"
-    
+        kb_buttons.append([InlineKeyboardButton(text=f"🛒 {p.name} — {p.price:,} تومان", callback_data=f"select_plan_{p.id}")])
+
+    if show_amnezia:
+        text += "\n\n🟣 <b>پلن‌های Amnezia:</b>\n━━━━━━━━━━━━━━━━━━\n"
+        for p in amnezia_plans:
+            gb_price = p.price / p.traffic_gb if p.traffic_gb > 0 else 0
+            size_str = "♾️ نامحدود" if (p.traffic_gb or 0) == 0 else f"{p.traffic_gb} گیگابایت"
+            text += (
+                f"\n🟣 <b>{p.name}</b>\n"
+                f"   📶 حجم: <b>{size_str}</b>\n"
+                f"   ⏳ مدت: <b>{p.duration_days} روز</b>\n"
+                f"   💰 قیمت: <b>{p.price:,} تومان</b>"
+            )
+            if gb_price > 0:
+                text += f" | <i>~{gb_price:,.0f} تومان/گیگ</i>"
+            text += "\n"
+            kb_buttons.append([InlineKeyboardButton(text=f"🟣 {p.name} — {p.price:,} تومان", callback_data=f"amzplan_{p.id}")])
+
     text += "\n👇 برای خرید، یکی از پلن‌ها را انتخاب کنید:"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🛒 {p.name} — {p.price:,} تومان", callback_data=f"select_plan_{p.id}")] for p in plans
-    ] + [[InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
-    return text, kb
+
+    kb_buttons.append([InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_buttons)
 
 @dp.callback_query(F.data == "buy_plan")
 async def show_plans_cb(callback: types.CallbackQuery, state: FSMContext):
-    text, kb = await show_plans_content(state)
+    text, kb = await show_plans_content(state, user_id=callback.from_user.id)
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("select_plan_"))
@@ -680,8 +749,9 @@ async def process_coupon(message: types.Message, state: FSMContext):
             return
         applicable = coupon.applicable_to
         data = await state.get_data()
-        action = data.get('action_type', 'NEW').lower()
-        # action_type is NEW/RENEW/TOPUP; coupon applicable keys are new/renewal/topup
+        # action_type is NEW/RENEW/TOPUP (optionally AMNEZIA_-prefixed);
+        # coupon applicable keys are new/renewal/topup
+        action = data.get('action_type', 'NEW').lower().replace('amnezia_', '')
         action_key = {'renew': 'renewal'}.get(action, action)
         if applicable != 'all':
             allowed = applicable.split(',')
@@ -697,40 +767,44 @@ async def show_payment(message: types.Message, state: FSMContext):
     data = await state.get_data()
     action = data.get('action_type', 'NEW')
     coupon_code = data.get('coupon_code')
-    
+    is_amnezia = str(action).startswith('AMNEZIA_')
+    base_action = action.replace('AMNEZIA_', '') if is_amnezia else action
+
     with SessionLocal() as db:
-        if action == 'NEW':
+        if base_action == 'NEW':
             plan = db.query(Plan).filter(Plan.id == data['plan_id']).first()
             original_price = plan.price
-        elif action == 'RENEW':
+        elif base_action == 'RENEW':
             plan = db.query(Plan).filter(Plan.id == data['plan_id']).first()
             original_price = plan.price
-        elif action == 'TOPUP':
+        elif base_action == 'TOPUP':
             original_price = data['total_price']
         else:
             original_price = 0
-        
+
         coupon = None
         if coupon_code:
             coupon = db.query(Coupon).filter(Coupon.code == coupon_code).first()
-        
-        final_price, discount, discount_desc = calculate_discount(original_price, action, coupon)
-        
+
+        final_price, discount, discount_desc = calculate_discount(original_price, base_action, coupon)
+
         card_info = db.query(AppSetting).filter(AppSetting.key == "payment_card").first()
         card_text = card_info.value if card_info else "<i>⚠️ اطلاعات پرداخت تنظیم نشده است. به مدیریت اطلاع دهید.</i>"
         size_setting = db.query(AppSetting).filter(AppSetting.key == 'max_receipt_size_mb').first()
         max_size_mb = int(size_setting.value) if size_setting else 10
-    
+
     msg = (
-        f"💳 <b>مرحله 3 از 3: پرداخت فاکتور</b>\n"
+        f"💳 <b>مرحله آخر: پرداخت فاکتور</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
     )
-    if action == 'NEW':
-        msg += f"📦 <b>پلن:</b> {plan.name}\n"
-    elif action == 'RENEW':
+    if base_action == 'NEW':
+        msg += f"{'🟣' if is_amnezia else '📦'} <b>پلن:</b> {plan.name}\n"
+    elif base_action == 'RENEW':
         msg += f"🔄 <b>تمدید:</b> {plan.name}\n"
-    elif action == 'TOPUP':
+    elif base_action == 'TOPUP':
         msg += f"➕ <b>حجم اضافه:</b> {data['added_gb']} گیگابایت\n"
+    if is_amnezia and data.get('amnezia_server_name'):
+        msg += f"🖥 <b>سرور Amnezia:</b> {data['amnezia_server_name']}\n"
     
     msg += f"💰 <b>قیمت اصلی:</b> {original_price:,} تومان\n"
     if discount > 0:
@@ -771,14 +845,15 @@ async def process_receipt(message: types.Message, state: FSMContext):
     photo = message.photo[-1]
     file_path = f"./storage/receipts/{message.from_user.id}_{time.time_ns()}.jpg"
     await bot.download(photo, destination=file_path)
-    
+
     action_type = data.get("action_type", "NEW")
     target_email = data.get("target_email", None)
     final_price = data.get("final_price", 0)
     original_price = data.get("original_price", 0)
     discount_amount = data.get("discount_amount", 0)
     coupon_code = data.get("coupon_code")
-    
+    is_amnezia = str(action_type).startswith("AMNEZIA_")
+
     with SessionLocal() as db:
         invoice = Invoice(
             telegram_user_id=message.from_user.id,
@@ -788,9 +863,18 @@ async def process_receipt(message: types.Message, state: FSMContext):
             original_price=original_price,
             discount_amount=discount_amount,
             coupon_code=coupon_code,
-            client_name=target_email if target_email else data['client_name'],
+            # Amnezia names are auto-assigned at provisioning time
+            # (amz_{user}_{invoice}); the chosen server and the optional panel
+            # account credentials ride in the description JSON.
+            client_name=(None if is_amnezia else (target_email if target_email else data.get('client_name'))),
             action_type=action_type,
-            screenshot_local_path=file_path
+            screenshot_local_path=file_path,
+            amnezia_service_id=data.get('target_service_id') if is_amnezia else None,
+            description=(json.dumps({k: v for k, v in {
+                "server_id": data.get('amnezia_server_id'),
+                "amz_username": data.get('amz_username'),
+                "amz_password": data.get('amz_password'),
+            }.items() if v is not None}) if is_amnezia else None),
         )
         db.add(invoice)
         db.commit()
@@ -842,10 +926,14 @@ async def process_receipt(message: types.Message, state: FSMContext):
             if plan:
                 plan_name = plan.name
     
-    caption = f"🧾 <b>فاکتور جدید #{invoice_id}</b>\n━━━━━━━━━━━━━━━━━━\n👤 خریدار: <b>{buyer_name}</b>\n📛 یوزرنیم: <code>{buyer_username}</code>\n🆔 شناسه: <code>{message.from_user.id}</code>\n🔖 نام سرویس: <code>{client_name}</code>"
+    caption = f"🧾 <b>فاکتور جدید #{invoice_id}</b>\n━━━━━━━━━━━━━━━━━━\n👤 خریدار: <b>{buyer_name}</b>\n📛 یوزرنیم: <code>{buyer_username}</code>\n🆔 شناسه: <code>{message.from_user.id}</code>"
+    if client_name:
+        caption += f"\n🔖 نام سرویس: <code>{client_name}</code>"
     if plan_name:
         caption += f"\n📦 پلن: <b>{plan_name}</b>"
     caption += f"\n⚡ نوع عملیات: <b>{action_type}</b>"
+    if is_amnezia and data.get('amnezia_server_name'):
+        caption += f"\n🖥 سرور Amnezia: <b>{data['amnezia_server_name']}</b>"
     if action_type == "TOPUP":
         caption += f"\n➕ حجم درخواستی: <b>{data['added_gb']} گیگ</b>"
     caption += f"\n💰 مبلغ نهایی: <b>{final_price:,} تومان</b>"
@@ -1077,6 +1165,458 @@ async def process_coupon_topup(message: types.Message, state: FSMContext):
     await delete_user_message(bot, message)
     await cleanup_prev_message(bot, state, message.chat.id)
     await show_payment(message, state)
+
+# ==============================================================================
+# AMNEZIA SERVICE FLOW (experimental; visibility gated by amnezia_visible)
+# Callback prefixes used here all start with "amz" so they never collide with
+# the XUI handlers above ("renew_", "topup_", "stat_", ...).
+# ==============================================================================
+def _amz_time_left(exp_dt):
+    """Human-readable time remaining until an aware datetime."""
+    if exp_dt is None:
+        return "♾️ نامحدود"
+    delta = exp_dt - datetime.now(timezone.utc)
+    if delta.total_seconds() <= 0:
+        return "منقضی شده"
+    if delta.days > 0:
+        return f"{delta.days} روز و {delta.seconds // 3600} ساعت"
+    return f"{delta.seconds // 3600} ساعت و {(delta.seconds % 3600) // 60} دقیقه"
+
+async def _amz_server_label(amz: AmneziaClient, server_id: int) -> str:
+    """Best-effort human label for a server id (uses resolved names)."""
+    try:
+        servers = await amz.list_servers_detailed()
+        for s in servers:
+            if s['id'] == server_id:
+                return s.get('name') or f"سرور {server_id}"
+    except Exception:
+        pass
+    return f"سرور {server_id}"
+
+AMNEZIA_ONE_DEVICE_WARNING = (
+    "⚠️ <b>نکته مهم درباره سرویس Amnezia</b>\n"
+    "━━━━━━━━━━━━━━━━━━\n\n"
+    "▫️ هر کانکشن Amnezia همزمان تنها روی <b>یک دستگاه</b> قابل استفاده است.\n"
+    "▫️ اتصال یک دستگاه دوم، اتصال دستگاه اول را قطع می‌کند.\n"
+    "▫️ این محدودیت ذاتی پروتکل است و <b>قابل حذف نمی‌باشد</b>.\n\n"
+    "با ادامه خرید، تأیید می‌کنید که از این موضوع اطلاع دارید."
+)
+
+@dp.callback_query(F.data.startswith("amzplan_"))
+async def amz_plan_selected(callback: types.CallbackQuery, state: FSMContext):
+    plan_id = int(callback.data.split("_")[1])
+    if not amnezia_visible(callback.from_user.id):
+        return await callback.answer("⛔ این بخش در دسترس شما نیست.", show_alert=True)
+    with SessionLocal() as db:
+        plan = db.query(Plan).filter(Plan.id == plan_id, Plan.is_active == True).first()
+        owned_before = db.query(AmneziaService.id).filter(
+            AmneziaService.telegram_user_id == callback.from_user.id).first() is not None
+    if not plan or plan.service_type != 'amnezia':
+        return await callback.answer("⚠️ این پلن Amnezia معتبر نیست.", show_alert=True)
+    await state.update_data(plan_id=plan_id, action_type="NEW")
+    if not owned_before:
+        return await callback.message.edit_text(
+            AMNEZIA_ONE_DEVICE_WARNING,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ فهمیدم، ادامه خرید", callback_data=f"amzok_{plan_id}")],
+                [InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")],
+            ]), parse_mode="HTML")
+    await _amz_show_server_picker(callback.message, state, plan)
+
+@dp.callback_query(F.data.startswith("amzok_"))
+async def amz_ack_one_device(callback: types.CallbackQuery, state: FSMContext):
+    plan_id = int(callback.data.split("_")[1])
+    if not amnezia_visible(callback.from_user.id):
+        return await callback.answer("⛔ این بخش در دسترس شما نیست.", show_alert=True)
+    with SessionLocal() as db:
+        plan = db.query(Plan).filter(Plan.id == plan_id, Plan.is_active == True).first()
+    if not plan or plan.service_type != 'amnezia':
+        return await callback.answer("⚠️ این پلن Amnezia معتبر نیست.", show_alert=True)
+    await _amz_show_server_picker(callback.message, state, plan)
+
+async def _amz_show_server_picker(message: types.Message, state: FSMContext, plan: Plan):
+    """Show all discovered Amnezia servers (real names when known) for plan selection."""
+    unlimited = (plan.traffic_gb or 0) == 0
+    amz = AmneziaClient()
+    try:
+        try:
+            servers = await amz.list_servers_detailed()
+        except AttributeError:
+            servers = await amz.list_servers()
+    except AmneziaError as e:
+        logger.error(f"Amnezia server listing failed: {e}")
+        return await message.answer("❌ خطا در ارتباط با پنل Amnezia.")
+    finally:
+        await amz.close()
+    if not servers:
+        return await message.answer("⚠️ هیچ سروری در پنل Amnezia یافت نشد.")
+    kb_rows = []
+    for s in servers:
+        sname = s.get('name') or f"سرور {s['id']}"
+        if not s.get('alive', True):
+            sname += " (قطع)"
+        kb_rows.append([InlineKeyboardButton(text=f"🖥 {sname}",
+                                             callback_data=f"amzsrv_{plan.id}_{s['id']}")])
+    kb_rows.append([InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")])
+    text = (
+        f"🟣 <b>پلن:</b> {plan.name}\n\n"
+        f"🖥 <b>انتخاب لوکیشن سرور</b>\n\n"
+        f"سرور مورد نظر خود را انتخاب کنید:"
+    )
+    if unlimited:
+        text += ("\n\n⚠️ <b>توجه:</b> این پلن نامحدود فقط روی <b>همان یک سروری</b> که "
+                 "اینجا انتخاب می‌کنید فعال خواهد شد؛ بعداً قابل تغییر نیست.")
+    try:
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+                                parse_mode="HTML")
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+                             parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("amzsrv_"))
+async def amz_server_selected(callback: types.CallbackQuery, state: FSMContext):
+    _, plan_id, server_id = callback.data.split("_")
+    plan_id, server_id = int(plan_id), int(server_id)
+    # Resolve the human label for the receipt/invoice from the same listing.
+    label = f"سرور {server_id}"
+    amz = AmneziaClient()
+    try:
+        for s in await amz.list_servers_detailed():
+            if s['id'] == server_id and s.get('name'):
+                label = s['name']
+                break
+    except Exception:
+        pass
+    finally:
+        await amz.close()
+    await state.update_data(plan_id=plan_id, amnezia_server_id=server_id,
+                            amnezia_server_name=label,
+                            amz_username=None, amz_password=None)
+    await callback.message.edit_text(
+        "🔐 <b>حساب کاربری پنل Amnezia (اختیاری)</b>\n\n"
+        "می‌توانید برای ورود به پنل وب Amnezia نام کاربری و رمز عبور دلخواه انتخاب کنید:\n\n"
+        "▫️ فرمت پیام: <code>username password</code>\n"
+        "▫️ اگر فقط نام کاربری بفرستید، رمز به صورت خودکار ساخته می‌شود\n"
+        "▫️ نام کاربری: حروف انگلیسی/عدد/زیرخط (۳ تا ۳۲ کاراکتر)\n"
+        "▫️ رمز عبور: حداقل ۶ کاراکتر\n\n"
+        "💡 اگر این مرحله را رد کنید، حساب به صورت خودکار ساخته می‌شود.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ رد شدن و ساخت خودکار", callback_data="amzskipcreds")]
+        ]), parse_mode="HTML"
+    )
+    await state.set_state(BuyFlow.wait_for_amz_account)
+
+@dp.callback_query(BuyFlow.wait_for_amz_account, F.data == "amzskipcreds")
+async def amz_skip_creds(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(amz_username=None, amz_password=None)
+    await cleanup_prev_message(bot, state, callback.message.chat.id)
+    await _amz_send_coupon_step(callback.message, state)
+
+@dp.message(BuyFlow.wait_for_amz_account)
+async def amz_process_creds(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    parts = text.split()
+    if not (1 <= len(parts) <= 2) or not text:
+        return await message.answer(
+            "⚠️ <b>فرمت نامعتبر.</b>\n\n"
+            "پیام را به شکل <code>username password</code> بفرستید "
+            "(یا فقط <code>username</code>)، یا «رد شدن» را بزنید.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ رد شدن و ساخت خودکار", callback_data="amzskipcreds")]
+            ]), parse_mode="HTML")
+    username = parts[0]
+    if not re.match(r"^[A-Za-z0-9_]{3,32}$", username):
+        return await message.answer(
+            "⚠️ <b>نام کاربری نامعتبر.</b>\n"
+            "فقط حروف انگلیسی، عدد و زیرخط؛ بین ۳ تا ۳۲ کاراکتر. دوباره بفرستید:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ رد شدن و ساخت خودکار", callback_data="amzskipcreds")]
+            ]), parse_mode="HTML")
+    if len(parts) == 2 and len(parts[1]) < 6:
+        return await message.answer(
+            "⚠️ <b>رمز عبور کوتاه است.</b>\nحداقل ۶ کاراکتر. دوباره بفرستید:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ رد شدن و ساخت خودکار", callback_data="amzskipcreds")]
+            ]), parse_mode="HTML")
+    # Uniqueness is enforced again at provisioning time (panel-side check).
+    amz = AmneziaClient()
+    try:
+        available = await amz.is_username_available(username, message.from_user.id)
+    except Exception:
+        available = True  # don't block the purchase on a transient panel error
+    finally:
+        await amz.close()
+    if not available:
+        return await message.answer(
+            "❌ <b>این نام کاربری قبلاً در پنل گرفته شده است.</b>\n"
+            "لطفاً نام کاربری دیگری بفرستید (یا «رد شدن» را بزنید):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ رد شدن و ساخت خودکار", callback_data="amzskipcreds")]
+            ]), parse_mode="HTML")
+    import secrets as _secrets
+    password = parts[1] if len(parts) == 2 else _secrets.token_urlsafe(12)
+    await state.update_data(amz_username=username, amz_password=password)
+    await delete_user_message(bot, message)
+    await cleanup_prev_message(bot, state, message.chat.id)
+    await _amz_send_coupon_step(message, state)
+
+async def _amz_send_coupon_step(message: types.Message, state: FSMContext):
+    # Choke point of the Amnezia NEW flow (skip-creds and custom-creds both
+    # land here): stamp the invoice action so process_receipt knows this is
+    # an Amnezia purchase (auto service name, description JSON, dispatch).
+    await state.update_data(action_type="AMNEZIA_NEW")
+    sent = await message.answer(
+        "🎫 <b>کد تخفیف</b>\n\n"
+        "اگر کد تخفیف دارید، آن را وارد کنید. در غیر این صورت «رد شدن» را بزنید.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ رد شدن", callback_data="skip_coupon")]
+        ]), parse_mode="HTML")
+    await state.update_data(last_bot_msg_id=sent.message_id)
+    await state.set_state(BuyFlow.wait_for_coupon)
+
+@dp.callback_query(F.data.startswith("amzren_"))
+async def amz_renew_start(callback: types.CallbackQuery, state: FSMContext):
+    sid = int(callback.data.split("_")[1])
+    with SessionLocal() as db:
+        svc = db.query(AmneziaService).filter(AmneziaService.id == sid).first()
+    if not svc:
+        return await callback.answer("⚠️ سرویس یافت نشد.", show_alert=True)
+    if svc.telegram_user_id != callback.from_user.id:
+        return await callback.answer("⛔ فقط مالک سرویس می‌تواند تمدید کند.", show_alert=True)
+    await state.update_data(action_type="AMNEZIA_RENEW", target_service_id=sid)
+    with SessionLocal() as db:
+        plans = db.query(Plan).filter(Plan.is_active == True, Plan.service_type == 'amnezia').all()
+    if not plans:
+        return await callback.answer("⚠️ هیچ پلن Amnezia فعالی برای تمدید وجود ندارد.", show_alert=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔄 {p.name} - {p.price:,} تومان", callback_data=f"amzp_{p.id}_{sid}")] for p in plans
+    ] + [[InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
+    await callback.message.edit_text(
+        f"🔄 <b>تمدید سرویس:</b> <code>{svc.name}</code>\n\nبرای تمدید یک پلن انتخاب کنید. حجم و روزهای باقیمانده حفظ و پلن جدید اضافه خواهد شد!",
+        reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("amzp_"))
+async def amz_renew_plan_picked(callback: types.CallbackQuery, state: FSMContext):
+    _, plan_id, sid = callback.data.split("_")
+    await state.update_data(plan_id=int(plan_id), target_service_id=int(sid))
+    await callback.message.edit_text(
+        "🎫 <b>کد تخفیف دارید؟</b>\nاگر کد دارید، آن را وارد کنید. در غیر این صورت «رد شدن» را بزنید.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ رد شدن", callback_data="skip_coupon")]
+        ]), parse_mode="HTML"
+    )
+    await state.set_state(BuyFlow.wait_for_coupon)
+
+@dp.callback_query(F.data.startswith("amztop_"))
+async def amz_topup_start(callback: types.CallbackQuery, state: FSMContext):
+    sid = int(callback.data.split("_")[1])
+    with SessionLocal() as db:
+        svc = db.query(AmneziaService).filter(AmneziaService.id == sid).first()
+        if not svc:
+            return await callback.answer("⚠️ سرویس یافت نشد.", show_alert=True)
+        if svc.telegram_user_id != callback.from_user.id:
+            return await callback.answer("⛔ فقط مالک سرویس می‌تواند حجم اضافه بخرد.", show_alert=True)
+        if (svc.quota_bytes or 0) == 0:
+            # Unlimited plan: the panel quota is account-wide; adding GB would
+            # silently CAP the account to the purchased amount.
+            return await callback.answer(
+                "♾️ این سرویس نامحدود است و خرید حجم اضافه ندارد.",
+                show_alert=True)
+        # Price per GB comes from the most recent plan-bearing COMPLETE invoice
+        inv = db.query(Invoice).filter(
+            Invoice.amnezia_service_id == sid,
+            Invoice.status == "COMPLETE",
+            Invoice.plan_id.isnot(None)
+        ).order_by(Invoice.created_at.desc()).first()
+        plan = db.query(Plan).filter(Plan.id == inv.plan_id).first() if inv else None
+        if not plan or plan.traffic_gb <= 0 or plan.price <= 0:
+            return await callback.answer(
+                "⚠️ قیمت هر گیگابایت برای این سرویس مشخص نیست. با پشتیبانی تماس بگیرید.",
+                show_alert=True)
+        discount_setting = db.query(AppSetting).filter(AppSetting.key == 'discount_percent').first()
+        discount_pct = int(discount_setting.value) if discount_setting else 5
+
+    await state.update_data(
+        action_type="AMNEZIA_TOPUP",
+        target_service_id=sid,
+        price_per_gb=plan.price / plan.traffic_gb,
+        plan_id=plan.id,
+        plan_name=plan.name,
+        discount_pct=discount_pct,
+    )
+    await prompt_custom_gb(callback.message, str(plan.price / plan.traffic_gb), state)
+
+@dp.callback_query(F.data.startswith("amzcfg_"))
+async def amz_get_config(callback: types.CallbackQuery):
+    sid = int(callback.data.split("_")[1])
+    with SessionLocal() as db:
+        svc = db.query(AmneziaService).filter(AmneziaService.id == sid).first()
+    if not svc:
+        return await callback.answer("⚠️ سرویس یافت نشد.", show_alert=True)
+    if svc.telegram_user_id != callback.from_user.id and callback.from_user.id not in get_admin_ids():
+        return await callback.answer("⛔ دسترسی ندارید.", show_alert=True)
+    await callback.answer("⏳ در حال دریافت کانفیگ...")
+    await bot.send_chat_action(callback.message.chat.id, "typing")  # panel can be slow
+
+    server_id, client_id = svc.server_id, svc.client_id
+    amz = AmneziaClient()
+    try:
+        # Resolve against the panel's LIVE connection record first — after a
+        # server reorder the stored index may be stale until the hourly sweep
+        # re-anchors it. The record is authoritative for both fields.
+        with SessionLocal() as db:
+            mapping_id = db.query(AmneziaService).filter(
+                AmneziaService.id == sid).first().panel_user_id
+        if mapping_id:
+            try:
+                for c in await amz.get_user_connections(mapping_id):
+                    if c.get('id') == svc.connection_id:
+                        server_id = c.get('server_id', server_id)
+                        client_id = c.get('client_id', client_id)
+                        break
+            except AmneziaError as e:
+                logger.warning(f"amz_get_config: live resolve failed, using stored ids: {e}")
+        cfg = await amz.get_connection_config(server_id, client_id)
+    except AmneziaError as e:
+        logger.error(f"amz_get_config failed for service {sid}: {e}")
+        return await callback.message.answer("❌ خطا در دریافت کانفیگ از پنل Amnezia. بعداً دوباره تلاش کنید.")
+    finally:
+        await amz.close()
+    vpn_link = cfg.get('vpn_link')
+    config_text = cfg.get('config') or ''
+    if vpn_link:
+        await callback.message.answer(
+            f"🔗 <b>لینک اتصال Amnezia:</b>\n<code>{vpn_link}</code>\n\n"
+            f"👆 این لینک را کپی و در برنامه Amnezia وارد کنید (گزینه Import).",
+            parse_mode="HTML")
+    if config_text:
+        await callback.message.answer_document(
+            BufferedInputFile(config_text.encode('utf-8'), filename=f"{svc.name}.conf"),
+            caption=f"📄 فایل کانفیگ سرویس <code>{svc.name}</code>", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("amzstat_"))
+async def amz_view_stats(callback: types.CallbackQuery):
+    sid = int(callback.data.split("_")[1])
+    is_admin_viewer = callback.from_user.id in get_admin_ids()
+    with SessionLocal() as db:
+        svc = db.query(AmneziaService).filter(AmneziaService.id == sid).first()
+        if not svc:
+            return await callback.answer("⚠️ سرویس یافت نشد.", show_alert=True)
+        if svc.telegram_user_id != callback.from_user.id and not is_admin_viewer:
+            return await callback.answer("⛔ دسترسی ندارید.", show_alert=True)
+        owner_id = svc.telegram_user_id
+        svc_info = {"name": svc.name, "status": svc.status, "quota": svc.quota_bytes,
+                    "expiry": svc.expiry_date, "server_id": svc.server_id,
+                    "panel_username": svc.panel_username}
+    await bot.send_chat_action(callback.message.chat.id, "typing")  # stats fetch hits the panel
+    amz = AmneziaClient()
+    try:
+        stats = None
+        server_label = await _amz_server_label(amz, svc_info["server_id"])
+        if svc_info.get("panel_username"):
+            try:
+                stats = await amz.get_user_stats(svc_info["panel_username"])
+            except AmneziaError as e:
+                logger.warning(f"amz stats fetch failed for {svc_info['panel_username']}: {e}")
+    finally:
+        await amz.close()
+
+    exp_dt = (stats or {}).get('expiration_date') or svc_info["expiry"]
+    expired = exp_dt is not None and exp_dt <= datetime.now(timezone.utc)
+    enabled = (stats or {}).get('enabled', True)
+    if expired:
+        status_badge = "🔴 منقضی شده"
+    elif not enabled:
+        status_badge = "🔴 غیرفعال"
+    elif svc_info["status"] != 'active':
+        status_badge = "⚪ " + svc_info["status"]
+    else:
+        status_badge = "🟢 فعال"
+
+    used_bytes = (stats or {}).get('used', 0)
+    limit_bytes = (stats or {}).get('limit') or svc_info["quota"] or 0
+    progress_bar = get_progress_bar(used_bytes, limit_bytes) if limit_bytes > 0 else "♾️"
+    text = (
+        f"📊 <b>داشبورد سرویس Amnezia</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔖 <b>نام:</b> <code>{svc_info['name']}</code>\n"
+        f"🖥 <b>سرور:</b> {server_label}\n"
+        f"📌 <b>وضعیت:</b> {status_badge}\n"
+        f"\n"
+        f"📈 <b>مصرف داده:</b>\n"
+        f"{progress_bar}\n"
+        f"📥 <b>مصرف شده:</b> {format_size(used_bytes)}\n"
+        f"📦 <b>کل حجم:</b> {format_size(limit_bytes) if limit_bytes > 0 else '♾️ نامحدود'}\n"
+        f"\n"
+        f"⏳ <b>زمان باقیمانده:</b> {_amz_time_left(exp_dt)}\n"
+        f"📅 <b>تاریخ انقضا:</b> {exp_dt.strftime('%Y-%m-%d %H:%M') if exp_dt else '♾️ نامحدود'}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    owner_only = owner_id == callback.from_user.id
+    kb_buttons = [[InlineKeyboardButton(text="📄 دریافت لینک و کانفیگ", callback_data=f"amzcfg_{sid}")]]
+    if owner_only:
+        kb_buttons.append([InlineKeyboardButton(text="🔑 مشخصات حساب پنل", callback_data=f"amzcreds_{sid}")])
+    if owner_only and svc_info["status"] == 'active':
+        action_row = [InlineKeyboardButton(text="🔄 تمدید سرویس", callback_data=f"amzren_{sid}")]
+        if (svc_info["quota"] or 0) != 0:   # unlimited services can't be topped up
+            action_row.append(InlineKeyboardButton(text="➕ خرید حجم اضافه", callback_data=f"amztop_{sid}"))
+        kb_buttons.append(action_row)
+    back_cb = "admin_amnezia" if (is_admin_viewer and not owner_only) else "my_plans"
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data=back_cb)])
+    await callback.message.edit_text(text, parse_mode="HTML",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@dp.callback_query(F.data.startswith("amzcreds_"))
+async def amz_show_account_creds(callback: types.CallbackQuery):
+    """Show the saved Amnezia panel-account credentials (owner only)."""
+    sid = int(callback.data.split("_")[1])
+    with SessionLocal() as db:
+        svc = db.query(AmneziaService).filter(AmneziaService.id == sid).first()
+        if not svc:
+            return await callback.answer("⚠️ سرویس یافت نشد.", show_alert=True)
+        if svc.telegram_user_id != callback.from_user.id:
+            return await callback.answer("⛔ فقط مالک سرویس می‌تواند مشخصات حساب را ببیند.", show_alert=True)
+    pw_line = (f"🔑 <b>رمز عبور:</b> <code>{svc.panel_password}</code>"
+               if svc.panel_password
+               else "🔑 <b>رمز عبور:</b> <i>موجود نیست.</i>")
+    panel_url = os.getenv('AMNEZIA_API_URL', '').rstrip('/')
+    await callback.message.answer(
+        f"🔐 <b>مشخصات حساب Amnezia این سرویس</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔖 سرویس: <code>{svc.name}</code>\n"
+        f"👤 <b>نام کاربری:</b> <code>{svc.panel_username or '—'}</code>\n"
+        f"{pw_line}\n\n"
+        f"🌐 ورود به پنل وب: {panel_url}\n\n"
+        f"💡 با این مشخصات می‌توانید در پنل وب وارد شوید و کانفیگ‌های خود را ببینید.",
+        parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_amnezia")
+async def admin_amnezia_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids():
+        return
+    with SessionLocal() as db:
+        rows = db.query(AmneziaService).order_by(AmneziaService.id.desc()).limit(30).all()
+    now_utc = datetime.now(timezone.utc)
+    text = (
+        "🟣 <b>مدیریت سرویس‌های Amnezia</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"📦 کل سرویس‌ها (۳۰ اخیر): <b>{len(rows)}</b>\n"
+        f"⚙️ نمایش برای کاربران عادی: <b>{'روشن' if AMNEZIA_ENABLED else 'خاموش (فقط ادمین‌ها)'}</b>\n"
+    )
+    kb_buttons = []
+    text += "<blockquote expandable>"
+    for s in rows:
+        live = s.status == 'active' and (s.expiry_date is None or s.expiry_date > now_utc)
+        emoji = '🟢' if live else '🔴'
+        exp_str = s.expiry_date.strftime('%Y-%m-%d') if s.expiry_date else '—'
+        text += f"\n{emoji} <code>{s.name}</code> | 👤 <code>{s.telegram_user_id}</code> | 📅 {exp_str}"
+        kb_buttons.append([InlineKeyboardButton(text=f"{emoji} {s.name}", callback_data=f"amzstat_{s.id}")])
+    if not rows:
+        text += "\n هنوز سرویسی ثبت نشده است."
+    text += "</blockquote>"
+    kb_buttons.append([InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="admin_amnezia")])
+    kb_buttons.append([InlineKeyboardButton(text="⚙️ پنل مدیریت", callback_data="admin_panel")])
+    await callback.message.edit_text(text, parse_mode="HTML",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
 
 # ==============================================================================
 # RESELLER PANEL (allowance-funded, no payment flow)
@@ -1328,6 +1868,19 @@ async def reseller_renew_start(callback: types.CallbackQuery, state: FSMContext)
     )
     await state.set_state(ResellerFlow.wait_for_renew_gb)
 
+@dp.callback_query(F.data.startswith("res_extend_"))
+async def reseller_extend_start(callback: types.CallbackQuery, state: FSMContext):
+    email = callback.data.split("_", 2)[2]
+    if not reseller_owns_email(callback.from_user.id, email):
+        return await callback.answer("⛔ این سرویس متعلق به شما نیست.", show_alert=True)
+    await state.update_data(res_email=email)
+    await callback.message.edit_text(
+        f"⏳ <b>افزایش مدت سرویس</b> <code>{email}</code>\n\n"
+        "تعداد روزی که می‌خواهید اضافه شود را وارد کنید (فقط عدد بزرگتر از صفر):",
+        reply_markup=get_cancel_kb(), parse_mode="HTML"
+    )
+    await state.set_state(ResellerFlow.wait_for_extend_days)
+
 async def _reseller_secondary_action(message: types.Message, state: FSMContext, action_type: str, allow_zero: bool):
     """Shared handler body for reseller topup/renew GB input."""
     if not is_reseller(message.from_user.id):
@@ -1391,6 +1944,29 @@ async def reseller_topup_gb(message: types.Message, state: FSMContext):
 @dp.message(ResellerFlow.wait_for_renew_gb)
 async def reseller_renew_gb(message: types.Message, state: FSMContext):
     await _reseller_secondary_action(message, state, "RESELLER_RENEW", allow_zero=True)
+
+@dp.message(ResellerFlow.wait_for_extend_days)
+async def reseller_extend_days(message: types.Message, state: FSMContext):
+    if not is_reseller(message.from_user.id):
+        return await state.clear()
+    if not message.text.strip().isdigit() or int(message.text.strip()) <= 0:
+        return await message.answer("⚠️ لطفاً تعداد روزی معتبر بزرگتر از صفر وارد کنید.", reply_markup=get_cancel_kb())
+    days = int(message.text.strip())
+    data = await state.get_data()
+    email = data.get('res_email')
+    if not email or not reseller_owns_email(message.from_user.id, email):
+        await state.clear()
+        return await message.answer("⛔ سرویس نامعتبر است.", reply_markup=get_reseller_menu())
+    with SessionLocal() as db:
+        invoice = Invoice(telegram_user_id=message.from_user.id, reseller_id=message.from_user.id,
+                          added_gb=0, total_price=0, original_price=0, discount_amount=0,
+                          client_name=email, action_type="RESELLER_EXTEND", status="PROCESSING",
+                          description=json.dumps({'days': days}))
+        db.add(invoice); db.commit(); db.refresh(invoice); invoice_id = invoice.id
+    tasks.provision_reseller_extend.delay(invoice_id)
+    await invalidate_user_service_cache(message.from_user.id)
+    await state.clear()
+    await message.answer(f"⏳ در حال افزودن {days} روز به <code>{email}</code>...", reply_markup=get_reseller_menu(), parse_mode="HTML")
 
 # ==============================================================================
 # RESELLER TRAFFIC PACK PURCHASE
@@ -1813,8 +2389,21 @@ async def my_plans_content(user_id: int):
             emails = db_emails
 
         await redis_client.set(cache_key, json.dumps(emails), ex=120)
-    
-    if not emails:
+
+    # Amnezia services (separate table) shown below the XUI ones.
+    with SessionLocal() as db:
+        amz_rows = db.query(AmneziaService).filter(
+            AmneziaService.telegram_user_id == user_id,
+            AmneziaService.status != 'deleted'
+        ).order_by(AmneziaService.id.asc()).all()
+    now_utc = datetime.now(timezone.utc)
+    amz_items = [{
+        "id": s.id,
+        "name": s.name,
+        "live": s.status == 'active' and (s.expiry_date is None or s.expiry_date > now_utc),
+    } for s in amz_rows]
+
+    if not emails and not amz_items:
         return (
             "📦 <b>سرویس‌های من</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -1887,7 +2476,9 @@ async def my_plans_content(user_id: int):
     expired_count = sum(1 for s in statuses.values() if s == 'expired')
     disabled_count = sum(1 for s in statuses.values() if s == 'disabled')
     unknown_count = sum(1 for s in statuses.values() if s == 'unknown')
-    
+    active_count += sum(1 for a in amz_items if a["live"])
+    expired_count += sum(1 for a in amz_items if not a["live"])
+
     text = (
         f"📦 <b>سرویس‌های من</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -1908,7 +2499,11 @@ async def my_plans_content(user_id: int):
         else:
             emoji = '❓'
         kb_buttons.append([InlineKeyboardButton(text=f"{emoji} {email}", callback_data=f"stat_{email}")])
-    
+
+    for a in amz_items:
+        emoji = '🟢' if a["live"] else '🔴'
+        kb_buttons.append([InlineKeyboardButton(text=f"🟣{emoji} {a['name']}", callback_data=f"amzstat_{a['id']}")])
+
     # Add user logs button
     kb_buttons.append([InlineKeyboardButton(text="📜 تاریخچه خرید و سرویس‌های حذف‌شده", callback_data="user_logs")])
     kb_buttons.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="main_menu")])
@@ -2035,6 +2630,7 @@ async def view_live_stats(callback: types.CallbackQuery):
         if not is_expired:
             res_actions.append(InlineKeyboardButton(text="🔄 تمدید (نمایندگی)", callback_data=f"res_renew_{email}"))
         kb_buttons.append(res_actions)
+        kb_buttons.append([InlineKeyboardButton(text="⏳ افزایش روزهای سرویس", callback_data=f"res_extend_{email}")])
         # Add toggle enable/disable button for resellers
         toggle_text = "🔒 غیرفعال کردن" if client_enabled else "🟢 فعال کردن"
         kb_buttons.append([InlineKeyboardButton(text=toggle_text, callback_data=f"res_toggle_{email}")])
@@ -2341,6 +2937,16 @@ async def admin_unstick_invoice(callback: types.CallbackQuery):
 async def show_admin_panel(callback: types.CallbackQuery):
     if callback.from_user.id not in get_admin_ids(): return
     await callback.message.edit_text("⚙️ <b>پنل مدیریت</b>", reply_markup=get_admin_menu(), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("admcat_"))
+async def admin_category_open(callback: types.CallbackQuery, state: FSMContext):
+    """Open one admin category submenu. The category buttons are pure
+    navigation — every action keeps its original callback, so nothing else
+    needed to change."""
+    if callback.from_user.id not in get_admin_ids(): return
+    await state.clear()
+    title, kb = get_admin_category_kb(callback.data)
+    await callback.message.edit_text(f"⚙️ <b>پنل مدیریت</b>\n{title}", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_sys_status")
 async def admin_sys_status(callback: types.CallbackQuery):
@@ -2974,6 +3580,35 @@ async def admin_approve_new(callback: types.CallbackQuery, state: FSMContext):
                 db.commit()
         await bot.send_message(invoice.telegram_user_id, "🎉 <b>پرداخت شما تایید شد!</b>\nبسته ترافیک شما در حال اضافه شدن است.\nپس از تکمیل، به شما اعلام خواهد شد.", parse_mode="HTML")
         return
+    elif invoice.action_type and invoice.action_type.startswith("AMNEZIA_"):
+        kind = invoice.action_type.split("_", 1)[1]  # NEW / RENEW / TOPUP
+        kind_captions = {
+            "NEW": "🟣 <b>در حال ساخت سرویس Amnezia...</b>",
+            "RENEW": "🔄 <b>در حال تمدید سرویس Amnezia...</b>",
+            "TOPUP": "➕ <b>در حال افزودن حجم Amnezia...</b>",
+        }
+        await callback.message.edit_caption(
+            caption=(f"{kind_captions.get(kind, '🟣 <b>در حال پردازش...</b>')}\n\n"
+                     f"وظیفه به صف پس‌زمینه برای فاکتور #{invoice_id} ارسال شد."),
+            reply_markup=None, parse_mode="HTML")
+        await redis_client.set(f"loading:{invoice_id}", f"{callback.message.chat.id}:{callback.message.message_id}", ex=300)
+        task_map = {
+            "NEW": tasks.provision_amnezia_new,
+            "RENEW": tasks.provision_amnezia_renew,
+            "TOPUP": tasks.provision_amnezia_topup,
+        }
+        task_map[kind].delay(invoice_id)
+        with SessionLocal() as db:
+            inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            inv.status = "PROCESSING"
+            db.commit()
+        kind_user_msgs = {
+            "NEW": "🎉 <b>پرداخت شما تایید شد!</b>\nسرویس Amnezia شما در حال ساخت است.\n🔗 لینک و کانفیگ پس از تکمیل برای شما ارسال خواهد شد.",
+            "RENEW": "🎉 <b>پرداخت شما تایید شد!</b>\nسرویس Amnezia شما در حال تمدید است.",
+            "TOPUP": "🎉 <b>پرداخت شما تایید شد!</b>\nحجم خریداری شده در حال اضافه شدن است.",
+        }
+        await bot.send_message(invoice.telegram_user_id, kind_user_msgs.get(kind, kind_user_msgs["NEW"]), parse_mode="HTML")
+        return
     xui = XUIClient()
     try:
         inbounds = await xui.get_enabled_inbounds()
@@ -3169,17 +3804,29 @@ async def add_plan_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("🏷 <b>نام پلن جدید را وارد کنید:</b>\n<i>(مثال: '50 گیگ - 1 ماهه')</i>", parse_mode="HTML", reply_markup=get_cancel_kb())
     await state.set_state(AddPlanFlow.wait_for_name)
 
+@dp.callback_query(F.data == "admin_add_plan_amz")
+async def add_plan_amz_start(callback: types.CallbackQuery, state: FSMContext):
+    """Same wizard as admin_add_plan but preset to the Amnezia service type
+    (the type question at the end is skipped)."""
+    if callback.from_user.id not in get_admin_ids(): return
+    await state.update_data(service_type='amnezia')
+    await callback.message.edit_text(
+        "🟣 <b>نام پلن Amnezia جدید را وارد کنید:</b>\n"
+        "<i>(مثال: 'نامحدود - 1 ماهه' — حجم ۰ به معنای نامحدود است)</i>",
+        parse_mode="HTML", reply_markup=get_cancel_kb())
+    await state.set_state(AddPlanFlow.wait_for_name)
+
 @dp.message(AddPlanFlow.wait_for_name)
 async def add_plan_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("📶 <b>حجم این پلن را به گیگابایت وارد کنید:</b>", parse_mode="HTML", reply_markup=get_cancel_kb())
+    await message.answer("📶 <b>حجم این پلن را به گیگابایت وارد کنید:</b>\n\n💡 عدد ۰ = <b>نامحدود</b> (برای پلن‌های Amnezia)", parse_mode="HTML", reply_markup=get_cancel_kb())
     await state.set_state(AddPlanFlow.wait_for_gb)
 
 @dp.message(AddPlanFlow.wait_for_gb)
 async def add_plan_gb(message: types.Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("⚠️ فقط عدد وارد کنید.", reply_markup=get_cancel_kb())
     await state.update_data(gb=int(message.text))
-    await message.answer("⏳ <b>مدت زمان پلن را به روز وارد کنید:</b>", parse_mode="HTML", reply_markup=get_cancel_kb())
+    await message.answer("⏳ <b>مدت زمان پلن را به روز وارد کنید:</b>\n\n💡 حجم ۰ به معنای <b>نامحدود</b> است (مخصوص پلن‌های Amnezia).", parse_mode="HTML", reply_markup=get_cancel_kb())
     await state.set_state(AddPlanFlow.wait_for_days)
 
 @dp.message(AddPlanFlow.wait_for_days)
@@ -3192,12 +3839,38 @@ async def add_plan_days(message: types.Message, state: FSMContext):
 @dp.message(AddPlanFlow.wait_for_price)
 async def add_plan_price(message: types.Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("⚠️ فقط عدد وارد کنید.", reply_markup=get_cancel_kb())
+    await state.update_data(price=int(message.text))
+    data = await state.get_data()
+    if data.get('service_type') == 'amnezia':
+        # Started from the dedicated 🟣 shortcut — type already chosen.
+        with SessionLocal() as db:
+            db.add(Plan(name=data['name'], traffic_gb=data['gb'], duration_days=data['days'],
+                        price=data['price'], is_active=True, service_type='amnezia'))
+            db.commit()
+        await state.clear()
+        return await message.answer(
+            f"✅ <b>پلن Amnezia '{data['name']}' با موفقیت اضافه شد!</b>",
+            parse_mode="HTML", reply_markup=get_admin_menu())
+    await message.answer(
+        "🖥 <b>این پلن برای کدام سرویس است؟</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ سرویس معمولی (XUI)", callback_data="pltype_xui"),
+             InlineKeyboardButton(text="🟣 Amnezia", callback_data="pltype_amnezia")]],
+        ), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("pltype_"))
+async def add_plan_type_chosen(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    stype = callback.data.split("_")[1]
     data = await state.get_data()
     with SessionLocal() as db:
-        db.add(Plan(name=data['name'], traffic_gb=data['gb'], duration_days=data['days'], price=int(message.text), is_active=True))
+        db.add(Plan(name=data['name'], traffic_gb=data['gb'], duration_days=data['days'],
+                    price=data['price'], is_active=True,
+                    service_type=stype if stype == 'amnezia' else 'xui'))
         db.commit()
     await state.clear()
-    await message.answer(f"✅ <b>پلن '{data['name']}' با موفقیت اضافه شد!</b>", parse_mode="HTML", reply_markup=get_admin_menu())
+    label = "🟣 Amnezia" if stype == 'amnezia' else "⚙️ XUI"
+    await callback.message.edit_text(f"✅ <b>پلن '{data['name']}' ({label}) با موفقیت اضافه شد!</b>", parse_mode="HTML", reply_markup=get_admin_menu())
 
 @dp.callback_query(F.data == "admin_view_plans")
 async def view_active_plans(callback: types.CallbackQuery):
@@ -3212,8 +3885,9 @@ async def view_active_plans(callback: types.CallbackQuery):
     text = "📋 <b>مدیریت پلن‌های فعال</b>\n━━━━━━━━━━━━━━━━━━\n"
     for i, p in enumerate(plans, 1):
         gb_price = p.price / p.traffic_gb if p.traffic_gb > 0 else 0
+        type_badge = "🟣 Amnezia" if p.service_type == 'amnezia' else "⚙️ XUI"
         text += (
-            f"\n{i}️⃣ <b>{p.name}</b>\n"
+            f"\n{i}️⃣ <b>{p.name}</b> ({type_badge})\n"
             f"   📶 {p.traffic_gb} گیگابایت | ⏳ {p.duration_days} روز\n"
             f"   💰 {p.price:,} تومان"
         )
@@ -5054,34 +5728,36 @@ async def user_logs_callback(callback: types.CallbackQuery):
         # Show successful purchases with invoice numbers
         if successful_purchases:
             text += f"✅ <b>خریدهای موفق ({len(successful_purchases)} مورد)</b>\n"
-            text += f"──────────────────\n"
+            text += "<blockquote expandable>"
             for i, purchase in enumerate(successful_purchases[:10], 1):  # Limit to 10 most recent
                 date_str = purchase['created_at'].strftime('%Y/%m/%d') if purchase['created_at'] else 'نامشخص'
                 service_name = purchase['client_name'] or 'سرویس'
                 price = f"{purchase['total_price']:,}"
                 invoice_num = f"#{purchase['id']}"
-                
+
                 text += f"{i}. 📦 {service_name}\n"
                 text += f"   📅 تاریخ: {date_str} | 💰 مبلغ: {price} تومان\n"
                 text += f"   🧾 شماره فاکتور: {invoice_num}\n\n"
-            
+
             if len(successful_purchases) > 10:
-                text += f"... و {len(successful_purchases) - 10} مورد دیگر\n\n"
-        
+                text += f"... و {len(successful_purchases) - 10} مورد دیگر\n"
+            text += "</blockquote>\n"
+
         # Show deleted services
         if deleted_services:
-            text += f"\n❌ <b>سرویس‌های حذف‌شده ({len(deleted_services)} مورد)</b>\n"
-            text += f"──────────────────\n"
+            text += f"❌ <b>سرویس‌های حذف‌شده ({len(deleted_services)} مورد)</b>\n"
+            text += "<blockquote expandable>"
             for i, deleted in enumerate(deleted_services[:5], 1):  # Limit to 5 most recent
                 date_str = deleted['created_at'].strftime('%Y/%m/%d') if deleted['created_at'] else 'نامشخص'
                 service_name = deleted['client_name'] or 'سرویس'
-                
+
                 text += f"{i}. 🗑 {service_name}\n"
                 text += f"   📅 تاریخ ایجاد: {date_str}\n"
                 text += f"   ⚠️ به دلیل عدم تمدید حذف شده است\n\n"
-            
+
             if len(deleted_services) > 5:
                 text += f"... و {len(deleted_services) - 5} مورد دیگر\n"
+            text += "</blockquote>"
         
         if not successful_purchases and not deleted_services:
             text += "ℹ️ هنوز خرید موفقی ثبت نشده است.\n"
