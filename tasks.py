@@ -24,6 +24,12 @@ from src.utils.alerting import should_alert, is_noise, format_alert
 # ---- Alert admins when a background task fails permanently ----
 # Autoretried tasks only reach this on FINAL failure (intermediate retries
 # emit task_retry instead), so a page here means real, unrecovered breakage.
+def _admin_ids():
+    """Admin Telegram IDs from env — same pattern used across this module.
+    Was previously referenced but never defined, crashing the watchdog
+    alerts and the daily digest with NameError."""
+    return [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+
 from celery.signals import task_failure
 
 @task_failure.connect

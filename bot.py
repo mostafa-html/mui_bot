@@ -4943,8 +4943,8 @@ async def _show_reseller_detail(message, rid):
     text += f"━━━━━━━━━━━━━━━━━━\nعملیات مورد نظر را انتخاب کنید:"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ شارژ ترافیک", callback_data=f"res_grant_{rid}")],
-        [InlineKeyboardButton(text="🔄 تغییر وضعیت", callback_data=f"res_toggle_{rid}")],
-        [InlineKeyboardButton(text="🗑 حذف نماینده", callback_data=f"res_delete_{rid}")],
+        [InlineKeyboardButton(text="🔄 تغییر وضعیت", callback_data=f"admres_toggle_{rid}")],
+        [InlineKeyboardButton(text="🗑 حذف نماینده", callback_data=f"admres_delete_{rid}")],
         [InlineKeyboardButton(text="⬅️ بازگشت به لیست", callback_data="admin_list_resellers")]
     ])
     await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -4955,12 +4955,12 @@ async def admin_reseller_detail(callback: types.CallbackQuery):
     rid = int(callback.data.split("_")[2])
     await _show_reseller_detail(callback.message, rid)
 
-@dp.callback_query(F.data.regexp(r'^res_delete_\d+$'))
+@dp.callback_query(F.data.regexp(r'^admres_delete_\d+$'))
 async def admin_reseller_delete_confirm(callback: types.CallbackQuery):
     if callback.from_user.id not in get_admin_ids(): return
     rid = int(callback.data.split("_")[2])
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ بله، حذف شود", callback_data=f"res_delete_confirm_{rid}")],
+        [InlineKeyboardButton(text="✅ بله، حذف شود", callback_data=f"admres_delete_confirm_{rid}")],
         [InlineKeyboardButton(text="❌ انصراف", callback_data=f"res_detail_back_{rid}")]
     ])
     await callback.message.edit_text(
@@ -4968,7 +4968,7 @@ async def admin_reseller_delete_confirm(callback: types.CallbackQuery):
         reply_markup=kb, parse_mode="HTML"
     )
 
-@dp.callback_query(F.data.regexp(r'^res_delete_confirm_\d+$'))
+@dp.callback_query(F.data.regexp(r'^admres_delete_confirm_\d+$'))
 async def admin_reseller_delete_execute(callback: types.CallbackQuery):
     if callback.from_user.id not in get_admin_ids(): return
     rid = int(callback.data.split("_")[3])
@@ -4999,10 +4999,13 @@ async def admin_reseller_grant(callback: types.CallbackQuery, state: FSMContext)
     )
     await state.set_state(AdminFlow.wait_for_reseller_allowance)
 
-@dp.callback_query(F.data.startswith("res_toggle_"))
+@dp.callback_query(F.data.startswith("admres_toggle_"))
 async def admin_reseller_toggle(callback: types.CallbackQuery):
     if callback.from_user.id not in get_admin_ids(): return
-    rid = int(callback.data.split("_")[2])
+    try:
+        rid = int(callback.data.split("_")[2])
+    except ValueError:
+        return await callback.answer("⚠️ درخواست نامعتبر است.", show_alert=True)
     with SessionLocal() as db:
         rec = db.query(Reseller).filter(Reseller.telegram_user_id == rid).first()
         if rec:
