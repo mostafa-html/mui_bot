@@ -30,6 +30,52 @@ def _admin_ids():
     alerts and the daily digest with NameError."""
     return [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
 
+# ---- Amnezia known-servers snapshot (for add/delete detection) ----
+KNOWN_SERVERS_KEY = 'amnezia_known_servers'
+
+async def _load_known_servers():
+    """{server_id: name} from Redis; {} when unavailable."""
+    url = os.getenv('REDIS_URL')
+    if not url:
+        return {}
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(url, decode_responses=True)
+        try:
+            raw = await r.hgetall(KNOWN_SERVERS_KEY)
+            return {int(k): v for k, v in (raw or {}).items()}
+        finally:
+            await r.aclose()
+    except Exception as e:
+        logging.debug(f"known-servers load skipped: {e}")
+        return {}
+
+async def _save_known_servers(mapping):
+    try:
+        url = os.getenv('REDIS_URL')
+        if not url:
+            return
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(url, decode_responses=True)
+        try:
+            await r.delete(KNOWN_SERVERS_KEY)
+            if mapping:
+                await r.hset(KNOWN_SERVERS_KEY,
+                             mapping={str(k): str(v) for k, v in mapping.items()})
+        finally:
+            await r.aclose()
+    except Exception as e:
+        logging.debug(f"known-servers save skipped: {e}")
+
+def _pick_migration_target(servers, alive_by_id, added_ids, exclude_id=None):
+    """Newly-added alive server first; else any alive server != excluded."""
+    candidates = [s['id'] for s in servers if s.get('alive', True)]
+    preferred = [i for i in added_ids if i in candidates and i != exclude_id]
+    if preferred:
+        return preferred[0]
+    others = [i for i in candidates if i != exclude_id]
+    return others[0] if others else None
+
 from celery.signals import task_failure
 
 @task_failure.connect
@@ -2092,6 +2138,97 @@ def provision_amnezia_trial(self, user_id: int):
     run_async(_run())
 
 
+
+def _parse_vless_membership(inbounds):
+    """PURE: from raw /panel/api/inbounds/list data, derive VLESS coverage.
+
+    Returns (target_ids, clients) where target_ids are the ENABLED inbound ids
+    whose protocol == 'vless', and clients maps every enabled vless-client
+    email to {"have": set(ids-present-in), "missing": set(target-ids-lacking),
+    "entry": the raw client dict}. Handles panel builds that return
+    ``settings`` either as a dict or as a JSON string.
+    """
+    import json as _json
+    target_ids = []
+    clients = {}
+    for ib in inbounds or []:
+        if ib.get('protocol') != 'vless' or not ib.get('enable', False):
+            continue
+        target_ids.append(ib['id'])
+        settings = ib.get('settings') or {}
+        if isinstance(settings, str):
+            try:
+                settings = _json.loads(settings)
+            except ValueError:
+                settings = {}
+        for cl in settings.get('clients', []) or []:
+            if cl.get('enable', True) is False:
+                continue   # audit scope is ENABLED vless users only
+            email = cl.get('email')
+            if not email:
+                continue
+            info = clients.setdefault(email, {"have": set(), "missing": set(),
+                                              "entry": cl})
+            info["have"].add(ib['id'])
+    for email, info in clients.items():
+        info["missing"] = set(target_ids) - info["have"]
+    return target_ids, clients
+
+
+@celery_app.task
+def audit_vless_inbounds(admin_id: int):
+    """Admin-triggered audit: ensure EVERY enabled VLESS client exists on ALL
+    enabled VLESS inbounds. Missing memberships are fixed via
+    delete+re-add-with-full-target-set (this panel build rejects duplicate
+    emails on /clients/add — verified live), preserving traffic counters
+    (keepTraffic=1), sub id, tgId, quota and expiry from the existing entry.
+    Admin receives a Persian summary DM when the batch finishes."""
+    async def _run():
+        xui = XUIClient()
+        try:
+            inbounds = await xui.get_inbounds()
+            target_ids, clients = _parse_vless_membership(inbounds)
+            if not target_ids:
+                await notify_user(admin_id, "⚠️ هیچ اینباند VLESS فعالی در پنل یافت نشد.")
+                return
+
+            complete, fixed, failures = [], [], []
+            for email, info in sorted(clients.items()):
+                if not info["missing"]:
+                    complete.append(email)
+                    continue
+                try:
+                    entry = info["entry"]
+                    await xui.delete_client(email, keep_traffic=True)
+                    await xui.add_client(
+                        email=email,
+                        total_bytes=entry.get('totalGB', 0),
+                        expiry_time=entry.get('expiryTime', 0),
+                        inbound_ids=sorted(target_ids),
+                        tg_id=entry.get('tgId') or None,
+                        sub_id=entry.get('subId') or None)
+                    fixed.append(email)
+                except Exception as e:
+                    failures.append(f"{email}: {str(e)[:120]}")
+
+            lines = [f"🔄 <b>گزارش بررسی اینباندهای VLESS</b>",
+                     "━━━━━━━━━━━━━━━━━━",
+                     f"👥 کل کاربران VLESS فعال: <b>{len(clients)}</b>",
+                     f"✅ کامل بودند: <b>{len(complete)}</b>",
+                     f"🔧 اصلاح شدند: <b>{len(fixed)}</b>"]
+            if fixed[:15]:
+                lines.append("🛠 نمونه: " + ", ".join(f"<code>{e}</code>" for e in fixed[:15]))
+            lines.append(f"❌ خطاها: <b>{len(failures)}</b>")
+            for f_ in failures[:10]:
+                lines.append(f"▫️ <code>{f_}</code>")
+            if not clients:
+                lines.append("ℹ️ هیچ کاربر VLESS فعالی یافت نشد.")
+            await notify_user(admin_id, chr(10).join(lines))
+        finally:
+            await xui.close()
+    run_async(_run())
+
+
 @celery_app.task
 def check_amnezia_expiry():
     """Daily Amnezia expiry sweep: warn once ≤3 days before expiry; on expiry
@@ -2167,23 +2304,23 @@ def check_amnezia_expiry():
 
 @celery_app.task
 def check_amnezia_servers():
-    """Hourly Amnezia server health sweep.
+    """Hourly Amnezia server health sweep + AUTOMATIC FAILOVER.
 
     Panel server ids are LIST INDEXES — deleting OR REORDERING servers shifts
     every later index silently (confirmed in the panel's own source). The
     connection record fetched fresh from the panel is authoritative for both
     its current ``server_id`` and ``server_name``, so each service is
-    re-anchored whenever either differs:
+    re-anchored whenever either differs.
 
-      1. connection vanished from the panel -> notify owner,
-      2. stored (id, name) != current (id, name):
-           - name changed  -> physical move: re-anchor AND notify the owner,
-           - id-only shift -> pure reorder: re-anchor SILENTLY,
-      3. ping the (corrected) server: down/deleted -> notify once per episode;
-         back alive -> "back online" notice and clear the flag.
+    On top of re-anchoring, this sweep now OWNS migration: a Redis snapshot
+    (``amnezia_known_servers``) detects added/disappeared servers, and every
+    active service stranded on a dead/deleted server is automatically
+    re-created on a healthy target (newly-added server preferred), with the
+    fresh config/vpn link DM'd to the owner. Trials migrate too. If no alive
+    alternative exists, the previous warn-once behaviour applies.
 
-    All (id, name) pairs observed this run also rewrite the shared Redis name
-    cache, so the picker never shows post-reorder stale names for long.
+    All observed (id, name) pairs rewrite the shared name cache, and the live
+    set replaces the known-servers snapshot at the end of every run.
     """
     async def _run():
         now = datetime.now(timezone.utc)
@@ -2197,7 +2334,60 @@ def check_amnezia_servers():
             alive_by_id = {s['id']: s.get('alive', True) for s in servers}
             observed_server_names = {}
 
+            known = await _load_known_servers()
+            added_ids = [s['id'] for s in servers if s['id'] not in known]
+            if added_ids:
+                logging.info(f"check_amnezia_servers: new server(s) detected: {added_ids}")
+
             notifications = []
+            admin_notes = []
+            migrated_n = 0
+
+            async def _migrate_service(svc, old_server_id, old_client_id):
+                """Re-create the connection on a healthy target server and DM
+                the owner the fresh config. Returns True on success."""
+                target = _pick_migration_target(servers, alive_by_id,
+                                                added_ids, exclude_id=old_server_id)
+                if target is None:
+                    return False
+                target_name = next((s.get('name') for s in servers
+                                    if s['id'] == target), None) or f"سرور {target}"
+                new_name = f"{svc.name}m{int(time.time()) % 100000}"
+                created = await amz.add_connection(svc.panel_user_id, target, new_name)
+                # Re-point the service row at its new home (committed by the
+                # sweep's db.commit() after the loop).
+                svc.connection_id = created['connection_id']
+                svc.client_id = created['client_id']
+                svc.server_id = created['server_id']
+                svc.server_name = created.get('server_name') or target_name
+                svc.server_missing_notified_at = None
+                cfg = {}
+                try:
+                    cfg = await amz.get_connection_config(created['server_id'],
+                                                          created['client_id'])
+                except AmneziaError as e:
+                    logging.warning(f"migration config fetch failed for {svc.id}: {e}")
+                if old_client_id:
+                    try:
+                        await amz.remove_connection(old_server_id, old_client_id)
+                    except Exception:
+                        pass  # old server may be gone entirely — nothing to clean
+                vpn_link = cfg.get('vpn_link')
+                body = ("🚚 <b>سرور قبلی حذف شد — سرویس شما خودکار منتقل شد!</b>\n\n"
+                        f"🖥 سرور جدید: <b>{target_name}</b>\n"
+                        "📦 حجم و زمان شما بدون تغییر باقی مانده است.\n\n"
+                        "👇 لینک جدید را Import کنید (لینک قبلی دیگر کار نمی‌کند):")
+                if vpn_link:
+                    body += f"\n<code>{vpn_link}</code>"
+                await notify_user_with_buttons(svc.telegram_user_id, body,
+                    [[{"text": "❓ راهنما و رفع اشکال", "callback_data": "amzfaq"}]])
+                if cfg.get('config'):
+                    await send_user_document(svc.telegram_user_id,
+                                             f"{new_name}.conf",
+                                             cfg['config'].encode('utf-8'),
+                                             "📄 کانفیگ جدید سرویس شما")
+                return True
+
             with SessionLocal() as db:
                 services = db.query(AmneziaService).filter(
                     AmneziaService.status == 'active').all()
@@ -2214,11 +2404,17 @@ def check_amnezia_servers():
                             continue
                         tg_id = svc.telegram_user_id
                         conns_by_id = {c.get('id'): c for c in conns}
-
                         conn = conns_by_id.get(svc.connection_id)
 
                         # 1) Connection vanished from the panel entirely.
+                        #    Auto-failover first: the panel ACCOUNT survives even
+                        #    when its server/connection was deleted. No old
+                        #    client_id passed — nothing left to remove.
                         if conn is None:
+                            if svc.panel_user_id and \
+                                    await _migrate_service(svc, svc.server_id, None):
+                                migrated_n += 1
+                                continue
                             if (not svc.server_missing_notified_at or
                                     now - svc.server_missing_notified_at > timedelta(hours=24)):
                                 svc.server_missing_notified_at = now
@@ -2258,8 +2454,12 @@ def check_amnezia_servers():
                         label = svc.server_name or f"سرور {sid}"
                         alive = alive_by_id.get(sid)
 
-                        # 3) Reachability (None = server not in panel list anymore).
+                        # 3a) Dead/deleted server WITH a healthy target -> migrate.
                         if alive is None or alive is False:
+                            if await _migrate_service(svc, sid, svc.client_id):
+                                migrated_n += 1
+                                continue
+                            # 3b) No alternative — warn once per episode.
                             if (not svc.server_missing_notified_at or
                                     now - svc.server_missing_notified_at > timedelta(hours=24)):
                                 svc.server_missing_notified_at = now
@@ -2279,21 +2479,31 @@ def check_amnezia_servers():
                         logging.error(f"check_amnezia_servers error for service {svc.id}: {e}")
                         continue
                 db.commit()
-            # Rewrite the shared name cache from live records so picker labels
-            # heal after any reorder/rename within one sweep.
-            if observed_server_names:
-                await amz.replace_server_names(observed_server_names)
+
+            # Rewrite caches from live observations + persist the known-set.
+            merged_names = dict(await _load_known_servers())
+            merged_names.update(observed_server_names)
+            merged_names.update({s['id']: s.get('name') or '' for s in servers})
+            await _save_known_servers(merged_names)
+
+            if added_ids:
+                names = [next((s.get('name') for s in servers if s['id'] == i), f"سرور {i}")
+                         for i in added_ids]
+                admin_notes = admin_notes  # noqa: F841 (kept for clarity)
+                await notify_many_users([(aid,
+                    "🆕 <b>سرور جدید Amnezia شناسایی شد:</b> " +
+                    ", ".join(str(n) for n in names))
+                    for aid in _admin_ids()])
+            if migrated_n:
+                await notify_many_users([(aid,
+                    f"🚚 <b>جابجایی خودکار:</b> {migrated_n} سرویس به سرور سالم منتقل شد.")
+                    for aid in _admin_ids()])
             if notifications:
                 await notify_many_users(notifications)
         finally:
             await amz.close()
     run_async(_run())
 
-
-# ---- Watchdog: dead-man's switch + daily status digest ----
-# The BOT process touches the Redis key "bot:heartbeat" every minute (TTL
-# 5 min). This worker-side task reads it: if the key is gone, the bot
-# process is presumed dead even though the worker itself is healthy.
 
 @celery_app.task
 def system_heartbeat():

@@ -112,6 +112,7 @@ ADMIN_CATEGORIES = {
         ("🔧 تعمیر سرویس‌های نامرئی", "admin_reconcile_names"),
         ("👤 تعمیر یک کاربر", "admin_reconcile_user"),
         ("📥 همگام‌سازی گروه پنل", "admin_sync_group"),
+        ("🔄 بررسی اینباندهای VLESS", "admin_vless_audit"),
         ("💾 بکاپ به تلگرام", "admin_backup_tg"),
         ("🔄 پنیک/ری‌استارت", "admin_restart_menu"),
     ]),

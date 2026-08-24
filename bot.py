@@ -3421,6 +3421,34 @@ async def adm_clearip_user(callback: types.CallbackQuery):
 # client_name was stored as the bare typed name instead of the real panel email
 # ({name}_{invoice_id}). These handlers repair that mismatch (name repair only).
 
+@dp.callback_query(F.data == "admin_vless_audit")
+async def admin_vless_audit_ask(callback: types.CallbackQuery):
+    """Confirm before launching the VLESS inbound-coverage audit (panel writes)."""
+    if callback.from_user.id not in get_admin_ids():
+        return
+    await callback.message.edit_text(
+        "🔄 <b>بررسی اینباندهای VLESS</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "▫️ همه کاربران <b>VLESS فعال</b> پنل بررسی می‌شوند.\n"
+        "▫️ هر کلاینت که در بعضی اینباندها غایب باشد، به <b>تمام اینباندهای فعال VLESS</b> اضافه می‌شود.\n"
+        "▫️ آمار مصرف، لینک ساب و تنظیمات هر کاربر حفظ می‌شود.\n\n"
+        "⏳ نتیجه به‌صورت پیام جداگانه برای شما ارسال خواهد شد.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 شروع بررسی و اصلاح", callback_data="admin_vless_audit_go")],
+            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_panel")],
+        ]), parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_vless_audit_go")
+async def admin_vless_audit_go(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids():
+        return
+    tasks.audit_vless_inbounds.delay(callback.from_user.id)
+    await callback.message.edit_text(
+        "✅ <b>بررسی شروع شد.</b>\n\nنتیجه پس از اتمام به‌صورت پیام جداگانه ارسال می‌شود.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_panel")]
+        ]), parse_mode="HTML")
+
 @dp.callback_query(F.data == "admin_reconcile_names")
 async def admin_reconcile_names(callback: types.CallbackQuery):
     """Kick off a full-panel scan on the worker. It's a multi-minute job

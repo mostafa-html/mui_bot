@@ -176,11 +176,15 @@ class XUIClient:
         inbounds = await self.get_inbounds()
         return [ib for ib in inbounds if ib.get('enable', False)]
 
-    async def add_client(self, email: str, total_bytes: int, expiry_time: int, inbound_ids: list):
-        payload = {
-            "client": {"email": email, "totalGB": total_bytes, "expiryTime": expiry_time, "enable": True},
-            "inboundIds": inbound_ids,
-        }
+    async def add_client(self, email: str, total_bytes: int, expiry_time: int,
+                         inbound_ids: list, tg_id=None, sub_id=None):
+        client = {"email": email, "totalGB": total_bytes,
+                  "expiryTime": expiry_time, "enable": True}
+        if tg_id:
+            client["tgId"] = tg_id
+        if sub_id:
+            client["subId"] = sub_id
+        payload = {"client": client, "inboundIds": inbound_ids}
         return await self._request("POST", "/panel/api/clients/add", json=payload)
 
     async def assign_group(self, email: str, tg_id: str):
@@ -245,8 +249,12 @@ class XUIClient:
         res = await self._request("POST", "/panel/api/clients/delDepleted")
         return res.get('obj', {})
 
-    async def delete_client(self, email: str):
-        return await self._request("POST", f"/panel/api/clients/del/{email}?keepTraffic=0")
+    async def delete_client(self, email: str, keep_traffic: bool = False):
+        """keep_traffic=True preserves the client's usage counters — required
+        before a delete/re-create inbound-membership fix so users don't lose
+        their traffic statistics."""
+        return await self._request(
+            "POST", f"/panel/api/clients/del/{email}?keepTraffic={1 if keep_traffic else 0}")
 
     async def restart_xray(self):
         return await self._request("POST", "/panel/api/server/restartXrayService")
