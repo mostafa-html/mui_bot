@@ -2432,13 +2432,14 @@ async def reseller_pack_receipt_invalid(message: types.Message, state: FSMContex
 # ==============================================================================
 # RESELLER SERVICE DELETION
 # ==============================================================================
-def _client_toggle_payload(client_data: dict, new_enable: bool) -> dict:
+def _client_toggle_payload(client_data: dict, new_enable: bool,
+                           email: str = None) -> dict:
     """Minimal /clients/update payload for enable-flips — the same shape
     proven across provision/renew/top-up. NEVER echo the raw panel record:
     this panel's Go endpoint expects Client.id as a string, and echoing the
     fetched dict (numeric id) crashes with a JSON unmarshal error."""
     return {
-        "email": client_data.get('email'),
+        "email": client_data.get('email') or email,
         "totalGB": client_data.get('totalGB', 0),
         "expiryTime": client_data.get('expiryTime', 0),
         "tgId": client_data.get('tgId', 0),
@@ -2456,7 +2457,7 @@ async def reseller_toggle_service(callback: types.CallbackQuery):
         return await callback.answer("❌ سرویس در پنل یافت نشد.", show_alert=True)
     client_data = full['client']
     new_enable = not client_data.get('enable', True)
-    await xui.update_client(email, _client_toggle_payload(client_data, new_enable))
+    await xui.update_client(email, _client_toggle_payload(client_data, new_enable, email=email))
     status_text = "فعال" if new_enable else "غیرفعال"
     await callback.answer(f"✅ وضعیت سرویس به {status_text} تغییر یافت.", show_alert=True)
     await invalidate_user_service_cache(callback.from_user.id)
@@ -3405,7 +3406,7 @@ async def adm_toggle_user(callback: types.CallbackQuery):
     full = await xui.get_client_full(email)
     client_data = full['client']
     new_enable = not client_data.get('enable', True)
-    await xui.update_client(email, _client_toggle_payload(client_data, new_enable))
+    await xui.update_client(email, _client_toggle_payload(client_data, new_enable, email=email))
     enable_state = new_enable
     await callback.answer(f"✅ وضعیت کلاینت به {'فعال' if enable_state else 'مسدود'} تغییر یافت.", show_alert=True)
     await callback.message.delete()

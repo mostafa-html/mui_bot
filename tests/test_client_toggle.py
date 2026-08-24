@@ -45,3 +45,11 @@ def test_subid_preserved_when_present_in_entry():
     entry if the panel build accepts it on update — harmless otherwise)."""
     p = bot._client_toggle_payload(RAW, False)
     assert "subId" not in p or p.get("subId") == RAW["subId"]
+
+
+def test_email_fallback_when_record_lacks_email():
+    """A record without an email must not send JSON null (same Go unmarshal
+    error class as the numeric-id crash) — the callback's known email wins."""
+    p = bot._client_toggle_payload({"id": 9, "enable": True}, True,
+                                   email="known@fallback")
+    assert p["email"] == "known@fallback"
