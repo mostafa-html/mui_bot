@@ -339,7 +339,10 @@ def run_migrations():
             'panel_user_id': 'VARCHAR',
             'panel_username': 'VARCHAR',
             'panel_password': 'VARCHAR',
-            'is_trial': 'BOOLEAN DEFAULT 0 NOT NULL' if not IS_SQLITE else 'BOOLEAN DEFAULT 0 NOT NULL',
+            # PostgreSQL rejects DEFAULT 0 on a boolean column — the literal
+            # must be FALSE (this exact bug silently skipped the migration
+            # on production Postgres while working fine under SQLite).
+            'is_trial': 'BOOLEAN NOT NULL DEFAULT FALSE',
         }.items():
             if col_name not in amnezia_service_columns:
                 with engine.connect() as conn:
