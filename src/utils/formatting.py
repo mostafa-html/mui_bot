@@ -36,6 +36,14 @@ def get_progress_bar(used: float, total: float, width: int = 10) -> str:
     return f"{bar} {pct}%"
 
 
+FA_DIGITS = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
+
+
+def fa_digits(value) -> str:
+    """Latin digits → Persian digits, for user-facing Persian copy."""
+    return str(value).translate(FA_DIGITS)
+
+
 def format_expiry_remaining(expiry_ms: int) -> str:
     """Show remaining time until expiry in Persian."""
     if expiry_ms <= 0:

@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Import config and utilities from src modules
 from src.config import BOT_TOKEN, REQUIRED_CHANNEL_ID, REQUIRED_CHANNEL_LINK, get_admin_ids, amnezia_visible, AMNEZIA_ENABLED
-from src.utils.formatting import format_size, format_price, get_progress_bar, format_expiry_remaining
+from src.utils.formatting import format_size, format_price, get_progress_bar, format_expiry_remaining, fa_digits
 from src.services.amnezia import AmneziaClient, AmneziaError, parse_expiration, PLAY_STORE_URL, APP_STORE_URL
 from src.utils.keyboard import (
     get_cancel_kb, get_back_kb, get_main_menu, get_admin_menu, get_reseller_menu,
@@ -491,6 +491,47 @@ def build_event_banner(event, ev_count: int) -> str:
         f"🎯 {event.required_invites} خرید موفق دوستان در بازه رویداد = یک جایزه رایگان\n"
         f"📊 پیشرفت رویداد: {ev_count} از {next_goal} — {next_goal - ev_count} خرید تا جایزه بعدی\n"
         f"⏳ حدود {remaining} ساعت مانده\n"
+    )
+
+
+def _event_prize_line(db, event) -> str:
+    """Concrete prize text for announcements: always shows size/duration,
+    pulled from exactly what the admin picked in the wizard. Persian digits."""
+    if event.service_type == 'vless':
+        plan = db.query(Plan).filter(Plan.id == event.vless_plan_id).first()
+        if plan:
+            gb = fa_digits(f"{plan.traffic_gb:g}").replace('.', '٫')
+            days = fa_digits(plan.duration_days)
+            return f"⚡ کانفیگ VLESS پلن «{plan.name}»، {gb} گیگابایت {days} روزه"
+    elif event.service_type == 'amnezia':
+        gb = fa_digits(f"{event.amnezia_gb:g}").replace('.', '٫')
+        days = fa_digits(event.amnezia_days)
+        return f"🟣 کانفیگ Amnezia {gb} گیگابایت {days} روزه"
+    return tasks.describe_event_reward(db, event)
+
+
+def build_event_announcement(event, reward_desc: str) -> str:
+    """Channel announcement posted the moment an event starts.
+    ADHD-friendly: short scannable lines, numbers first, one idea per line."""
+    hours_left = max(1, -(-(event.ends_at - datetime.now(timezone.utc)).total_seconds() // 3600))
+    x = fa_digits(event.required_invites)
+    h = fa_digits(int(hours_left))
+    return (
+        f"🔥🔥🔥\n\n"
+        f"<b>🎉 {event.title} شروع شد!</b>\n\n"
+        f"🎁 <b>جایزه:</b> {reward_desc}\n"
+        f"🎯 <b>هدف:</b> هر {x} خرید موفق = ۱ جایزه\n"
+        f"⏳ <b>مهلت:</b> فقط {h} ساعت!\n\n"
+        f"<b>📌 قوانین:</b>\n\n"
+        f"✅ ورود با لینک دعوت خودت\n"
+        f"✅ ثبت‌نام و خرید داخل بازه رویداد\n"
+        f"✅ تمدید و شارژ هم حساب می\u200cشه\n"
+        f"❌ اکانت تست رایگان\n"
+        f"❌ معرفی خودت 😄\n\n"
+        f"♾️ سقف نداریم! هر {x} خرید، یه جایزه.\n"
+        f"دعوت کن، جمع کن!\n\n"
+        f"👇 لینک دعوتت داخل ربات:\n"
+        f"🤝 منوی «دعوت از دوستان»"
     )
 
 async def referral_info_content(user_id: int) -> tuple:
@@ -4910,9 +4951,24 @@ async def admin_event_confirm(callback: types.CallbackQuery, state: FSMContext):
             is_active=True)
         db.add(event)
         db.commit()
+        announce_text = build_event_announcement(event, _event_prize_line(db, event))
+    announce_status = ""
+    try:
+        bot_me = await bot.get_me()
+        await bot.send_message(
+            REQ_CHANNEL_ID, announce_text, parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🚀 شروع و دریافت لینک دعوت",
+                                     url=f"https://t.me/{bot_me.username}")
+            ]]))
+    except Exception as e:
+        logger.error(f"Event announcement to channel failed: {e}")
+        announce_status = ("\n\n⚠️ <b>اعلان در کانال ارسال نشد!</b>\n"
+                           "ربات را ادمین کانال کنید (دسترسی ارسال پیام) و دستی اعلام کنید.")
     await state.clear()
     await callback.message.edit_text(
-        f"🔥 <b>رویداد شروع شد!</b>\nکاربران از منوی «🤝 دعوت از دوستان» پیشرفت خود را می‌بینند.",
+        f"🔥 <b>رویداد شروع شد!</b>\nکاربران از منوی «🤝 دعوت از دوستان» پیشرفت خود را می‌بینند.{announce_status}",
         reply_markup=get_admin_menu(), parse_mode="HTML")
 
 

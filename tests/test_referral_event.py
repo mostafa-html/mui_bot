@@ -414,3 +414,50 @@ def test_event_banner_builder():
     assert '3' in banner and '4' in banner          # goal + progress toward next (6)
     assert '6' in banner                            # next multiple shown
     assert '47' in banner                           # countdown hours
+
+
+def test_event_announcement_builder():
+    import bot
+    now = datetime.now(timezone.utc)
+    from database import ReferralEvent
+    ev = ReferralEvent(title='رویداد معرفی', required_invites=3, service_type='vless',
+                       vless_plan_id=5,
+                       starts_at=now - HOUR, ends_at=now + timedelta(hours=48))
+    text = bot.build_event_announcement(ev, 'کانفیگ VLESS (پلن Evt 8GB)')
+    assert isinstance(text, str)
+    assert 'رویداد معرفی' in text
+    assert 'کانفیگ VLESS (پلن Evt 8GB)' in text          # prize verbatim
+    assert '۳' in text                                    # goal in Persian digits
+    assert '۴۸' in text                                   # hours in Persian digits
+    assert '3' not in text                                # no Latin goal digits leaked
+    for marker in ('قوانین', 'تست رایگان', 'سقف نداریم', 'مهلت'):
+        assert marker in text
+
+
+def test_fa_digits_conversion():
+    from src.utils.formatting import fa_digits
+    assert fa_digits(48) == '۴۸'
+    assert fa_digits('12') == '۱۲'
+    assert fa_digits('a1b2') == 'a۱b۲'
+
+
+def test_event_prize_line_pulls_admin_choices():
+    import bot
+    from tests._bootstrap import seed_plan
+    seed_plan(9, name='Evt 15GB', gb=15, days=30, price=1, service_type='xui')
+    _clean_referral_tables()
+    now = datetime.now(timezone.utc)
+    from database import SessionLocal, ReferralEvent
+    ev = ReferralEvent(title='t', required_invites=2, service_type='vless',
+                       vless_plan_id=9, starts_at=now, ends_at=now + HOUR)
+    with SessionLocal() as db:
+        db.add(ev)
+        db.commit()
+        line = bot._event_prize_line(db, ev)
+        assert 'Evt 15GB' in line and '۱۵' in line and 'گیگابایت' in line and '۳۰ روزه' in line
+        # amnezia path falls back to describe_event_reward (GB+days already concrete)
+        ev.service_type = 'amnezia'
+        ev.amnezia_gb = 5
+        ev.amnezia_days = 10
+        line2 = bot._event_prize_line(db, ev)
+        assert 'Amnezia' in line2 and '۵ گیگابایت ۱۰ روزه' in line2
