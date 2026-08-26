@@ -13,15 +13,23 @@ from tests._bootstrap import bot, tasks  # noqa: F401
 
 
 def test_admin_ids_parses_env():
+    original = tasks.os.environ.get('ADMIN_CHAT_IDS')
     cases = [
         ('111', [111]),
         ('111 , 222', [111, 222]),
         ('111,,222,', [111, 222]),      # empties ignored
         ('', []),                        # no admins configured
     ]
-    for raw, expected in cases:
-        tasks.os.environ['ADMIN_CHAT_IDS'] = raw
-        assert tasks._admin_ids() == expected, raw
+    try:
+        for raw, expected in cases:
+            tasks.os.environ['ADMIN_CHAT_IDS'] = raw
+            assert tasks._admin_ids() == expected, raw
+    finally:
+        # never leak env state into later modules
+        if original is None:
+            tasks.os.environ.pop('ADMIN_CHAT_IDS', None)
+        else:
+            tasks.os.environ['ADMIN_CHAT_IDS'] = original
 
 
 def test_only_one_res_toggle_and_res_delete_service_registration():

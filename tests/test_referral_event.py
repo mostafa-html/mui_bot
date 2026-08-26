@@ -461,3 +461,67 @@ def test_event_prize_line_pulls_admin_choices():
         ev.amnezia_days = 10
         line2 = bot._event_prize_line(db, ev)
         assert 'Amnezia' in line2 and '۵ گیگابایت ۱۰ روزه' in line2
+
+
+def test_event_report_builder_and_stats():
+    import tasks
+    _clean_referral_tables(); _seed_code(1001); _seed_code(1002)
+    now = datetime.now(timezone.utc)
+    _seed_event(ev_id=30, x=2, start=now - timedelta(hours=49), hours=48)
+    _seed_referral(6001, 1001, now - timedelta(hours=48))
+    _seed_referral(6002, 1001, now - timedelta(hours=47), became_paid=True, paid_at=now - timedelta(hours=46))
+    _seed_referral(6003, 1001, now - timedelta(hours=47), became_paid=True, paid_at=now - timedelta(hours=45))
+    _seed_referral(6010, 1001, now - timedelta(hours=20))
+    _seed_referral(6004, 1002, now - timedelta(hours=40), became_paid=True, paid_at=now - timedelta(hours=39))
+    from database import SessionLocal, ReferralEvent, ReferralEventReward
+    with SessionLocal() as db:
+        db.add(ReferralEventReward(event_id=30, referrer_id=1001,
+                                   granted_at=now - timedelta(hours=44), service_type='vless'))
+        db.commit()
+    with SessionLocal() as db:
+        ev = db.query(ReferralEvent).filter(ReferralEvent.id == 30).first()
+        stats = tasks.event_report_stats(db, ev)
+        assert stats['participants'] == 2
+        assert stats['invites'] == 3                      # paid-only count
+        assert stats['rewards'] == 1
+        assert stats['top'][0] == (1001, 2, 1)            # rid, paid invites, rewards
+        assert stats['top'][1] == (1002, 1, 0)
+        text = tasks.build_event_report(db, ev, stats)
+    # don't leak an expired-active event into the auto-report sweep test below
+    with SessionLocal() as db:
+        ev = db.query(ReferralEvent).filter(ReferralEvent.id == 30).first()
+        ev.is_active = False
+        ev.result_reported = True
+        db.commit()
+    assert 'برترین' in text and 'گزارش' in text
+    assert str(1001) in text                              # IDs stay Latin (copyable)
+    assert '۳' in text                                    # totals in Persian digits
+
+
+def test_finished_event_auto_report_exactly_once():
+    _clean_referral_tables()
+    now = datetime.now(timezone.utc)
+    _seed_event(ev_id=31, start=now - timedelta(hours=50), hours=48)
+    import tasks
+    from database import SessionLocal, ReferralEvent
+    sent = []
+    orig = tasks.notify_many_users
+
+    async def _rec(notifs):
+        sent.extend(notifs)
+
+    tasks.notify_many_users = _rec
+    try:
+        tasks.report_finished_events.run()
+    finally:
+        tasks.notify_many_users = orig
+    with SessionLocal() as db:
+        ev = db.query(ReferralEvent).filter(ReferralEvent.id == 31).first()
+        assert ev.is_active is False and ev.result_reported is True
+    assert len(sent) == 1 and 'گزارش رویداد' in sent[0][1]
+    tasks.notify_many_users = _rec
+    try:
+        tasks.report_finished_events.run()                # replay → silent
+    finally:
+        tasks.notify_many_users = orig
+    assert len(sent) == 1                                 # exactly-once held

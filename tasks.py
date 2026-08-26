@@ -8,7 +8,7 @@ from celery import Celery
 from celery.schedules import crontab
 import redis.asyncio as redis
 import httpx
-from sqlalchemy import text
+from sqlalchemy import text, func, or_
 from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService, AmneziaTrial, ReferralEvent, ReferralEventReward
 from xui_client import XUIClient
 
@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import shared utilities to avoid duplication
-from src.utils.formatting import format_size
+from src.utils.formatting import format_size, fa_digits
 from src.services.reconcile import compute_reconcile, to_plan
 from src.services.amnezia import AmneziaClient, AmneziaError, PLAY_STORE_URL, APP_STORE_URL
 from src.utils.alerting import should_alert, is_noise, format_alert
@@ -185,6 +185,10 @@ celery_app.conf.beat_schedule = {
     'daily_status_digest': {
         'task': 'tasks.daily_status_digest',
         'schedule': crontab(hour=21, minute=0),
+    },
+    'report_finished_events': {
+        'task': 'tasks.report_finished_events',
+        'schedule': crontab(minute='*/5'),  # auto result report ≤5 min after an event ends
     },
 }
 
@@ -441,6 +445,82 @@ def mark_referral_paid(user_id: int):
                              f"{max(0, next_goal - ev_count)} نفر تا جایزه بعدی")
             notifications.append((referral.referrer_id, text))
     return notifications
+
+
+def event_report_stats(db, event):
+    """Numbers behind the result report: participants, paid invites in window,
+    rewards granted, top-5 leaderboard [(referrer_id, paid_invites, rewards)]."""
+    start = _naive_utc(event.starts_at)
+    end = _naive_utc(event.ends_at)
+    per_ref = db.query(Referral.referrer_id, func.count(Referral.id)).filter(
+        Referral.referred_at >= start,
+        Referral.paid_at.isnot(None),
+        Referral.paid_at <= end
+    ).group_by(Referral.referrer_id).all()
+    participants = db.query(func.count(func.distinct(Referral.referrer_id))).filter(
+        Referral.referred_at >= start).scalar() or 0
+    rewards_by_ref = dict(db.query(ReferralEventReward.referrer_id,
+                                   func.count(ReferralEventReward.id)).filter(
+        ReferralEventReward.event_id == event.id).group_by(
+        ReferralEventReward.referrer_id).all())
+    rewards_total = sum(rewards_by_ref.values())
+    top = sorted(((rid, cnt, rewards_by_ref.get(rid, 0)) for rid, cnt in per_ref),
+                 key=lambda r: r[1], reverse=True)[:5]
+    return {'participants': participants, 'invites': sum(cnt for _, cnt in per_ref),
+            'rewards': rewards_total, 'top': top}
+
+
+MEDALS = ('🥇', '🥈', '🥉', '🏅', '🏅')
+
+
+def build_event_report(db, event, stats):
+    """Admin-facing result report. ADHD-friendly Persian, Persian digits;
+    Telegram IDs stay Latin so they stay copyable."""
+    duration_h = max(1, int((_naive_utc(event.ends_at) - _naive_utc(event.starts_at)).total_seconds() // 3600))
+    x = fa_digits(event.required_invites)
+    h = fa_digits(duration_h)
+    text = (
+        f"📊 <b>گزارش {event.title}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 هدف: هر {x} خرید = ۱ جایزه\n"
+        f"🎁 جایزه: {describe_event_reward(db, event)}\n"
+        f"⏱ مدت رویداد: {h} ساعت\n\n"
+        f"<b>📈 آمار:</b>\n"
+        f"👥 شرکت‌کننده: {fa_digits(stats['participants'])} نفر\n"
+        f"🛒 خرید موفق: {fa_digits(stats['invites'])}\n"
+        f"🏆 جوایز اهدا شده: {fa_digits(stats['rewards'])}\n"
+    )
+    if stats['top']:
+        text += "\n<b>🏆 برترین\u200cها:</b>\n"
+        for medal, (rid, cnt, rw) in zip(MEDALS, stats['top']):
+            text += (f"{medal} کاربر <code>{rid}</code> — "
+                     f"{fa_digits(cnt)} خرید · {fa_digits(rw)} جایزه\n")
+    else:
+        text += "\n😅 هنوز قهرمانی نداشتیم.\n"
+    return text
+
+
+@celery_app.task
+def report_finished_events():
+    """Close expired-but-open events and send admins exactly ONE result
+    report each (result_reported flag makes replays silent)."""
+    texts = []
+    with SessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        finished = db.query(ReferralEvent).filter(
+            ReferralEvent.is_active == True,
+            ReferralEvent.ends_at <= now,
+            or_(ReferralEvent.result_reported.is_(False),
+                ReferralEvent.result_reported.is_(None)),
+        ).all()
+        for ev in finished:
+            texts.append(build_event_report(db, ev, event_report_stats(db, ev)))
+            ev.is_active = False
+            ev.result_reported = True
+        db.commit()
+    if texts:
+        run_async(notify_many_users(
+            [(aid, t) for aid in _admin_ids() for t in texts]))
 
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)

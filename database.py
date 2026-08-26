@@ -127,6 +127,7 @@ class ReferralEvent(Base):
     starts_at = Column(DateTime(timezone=True), nullable=False)
     ends_at = Column(DateTime(timezone=True), nullable=False)
     is_active = Column(Boolean, default=True)
+    result_reported = Column(Boolean, default=False)  # exactly-once guard for the auto report
 
 
 class ReferralEventReward(Base):
@@ -313,6 +314,14 @@ def run_migrations():
             paid_at_type = 'DATETIME' if IS_SQLITE else 'TIMESTAMPTZ'
             with engine.connect() as conn:
                 conn.execute(text(f"ALTER TABLE referrals ADD COLUMN paid_at {paid_at_type}"))
+                conn.commit()
+
+    # Referral events: exactly-once flag for the auto result report
+    if 'referral_events' in existing_tables:
+        event_cols = [col['name'] for col in inspector.get_columns('referral_events')]
+        if 'result_reported' not in event_cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE referral_events ADD COLUMN result_reported BOOLEAN"))
                 conn.commit()
 
     # Create reseller_packs table if it doesn't exist (handled by create_all, but ensure any missing columns)

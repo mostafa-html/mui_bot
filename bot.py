@@ -4815,6 +4815,7 @@ async def admin_referral_event_menu(callback: types.CallbackQuery, state: FSMCon
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ ساخت رویداد جدید", callback_data="admin_event_create")],
+            [InlineKeyboardButton(text="📊 گزارش آخرین رویداد", callback_data="admin_event_last_report")],
             [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_panel")]])
         await callback.message.edit_text("🔥 <b>رویداد معرفی</b>\n\nدر حال حاضر رویداد فعالی وجود ندارد.",
                                          reply_markup=kb, parse_mode="HTML")
@@ -4975,13 +4976,36 @@ async def admin_event_confirm(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "admin_event_end")
 async def admin_event_end(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in get_admin_ids(): return
+    report_text = None
     with SessionLocal() as db:
         event = tasks.get_active_event(db)
         if event:
             event.is_active = False
+            event.result_reported = True
             db.commit()
-    await callback.message.edit_text("🛑 <b>رویداد پایان یافت.</b>\nدیگر خریدی شمرده نمی‌شود.",
+            report_text = tasks.build_event_report(db, event, tasks.event_report_stats(db, event))
+    await callback.message.edit_text("🛑 <b>رویداد پایان یافت.</b>\nگزارش کامل برای شما ارسال شد.",
                                      reply_markup=get_admin_menu(), parse_mode="HTML")
+    if report_text:
+        for aid in get_admin_ids():
+            try:
+                await bot.send_message(aid, report_text, parse_mode="HTML",
+                                       disable_web_page_preview=True)
+            except Exception as e:
+                logger.debug(f"Event report send to admin {aid} failed: {e}")
+
+
+@dp.callback_query(F.data == "admin_event_last_report")
+async def admin_event_last_report(callback: types.CallbackQuery):
+    if callback.from_user.id not in get_admin_ids(): return
+    with SessionLocal() as db:
+        ev = db.query(ReferralEvent).order_by(ReferralEvent.ends_at.desc()).first()
+        if not ev:
+            return await callback.answer("هنوز رویدادی ساخته نشده.", show_alert=True)
+        text = tasks.build_event_report(db, ev, tasks.event_report_stats(db, ev))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_referral_event")]])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 # ==============================================================================
 # ADMIN: BROADCAST (message to all bot users)
