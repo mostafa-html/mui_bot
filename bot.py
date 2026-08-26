@@ -5445,10 +5445,11 @@ async def admin_toggle_reseller_inbound(callback: types.CallbackQuery, state: FS
 # ==============================================================================
 
 @dp.callback_query(F.data == "admin_traffic_packs")
-async def admin_traffic_packs(callback: types.CallbackQuery, state: FSMContext):
+async def admin_traffic_packs(callback: types.CallbackQuery, state: FSMContext | None = None):
     if callback.from_user.id not in get_admin_ids():
         return await callback.answer("⛔ دسترسی غیرمجاز", show_alert=True)
-    await state.clear()
+    if state is not None:
+        await state.clear()
     with SessionLocal() as db:
         packs = db.query(TrafficPack).order_by(TrafficPack.id.desc()).all()
     if not packs:

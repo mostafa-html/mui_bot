@@ -9,7 +9,7 @@ from celery.schedules import crontab
 import redis.asyncio as redis
 import httpx
 from sqlalchemy import text, func, or_
-from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService, AmneziaTrial, ReferralEvent, ReferralEventReward
+from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, TrafficPack, AmneziaService, AmneziaTrial, ReferralEvent, ReferralEventReward
 from xui_client import XUIClient
 
 from dotenv import load_dotenv
@@ -1650,31 +1650,36 @@ def check_expired_services_for_deletion():
                             inv.deletion_scheduled_at = expiry_date + timedelta(days=10)
                             db.commit()
                         
-                        # Calculate days until deletion
-                        days_until_deletion = (inv.deletion_scheduled_at - now).days
+                        # Calculate days until deletion (_naive_utc: SQLite reads
+                        # the column back naive; Postgres returns it aware)
+                        days_until_deletion = (_naive_utc(inv.deletion_scheduled_at) - _naive_utc(now)).days
                         
-                        # Send warnings on days 7, 8, 9 after expiry (before deletion on day 10)
-                        # Only send if we haven't sent 3 warnings yet
+                        # Send up to 3 warnings, at most one per sweep, starting day 7
+                        # after expiry. Catch-up: if a daily run was missed inside the
+                        # 7-9 window, later sweeps keep sending until the quota fills.
                         if inv.deletion_warning_sent_count < 3:
-                            if days_since_expiry in [7, 8, 9]:
-                                # Get service name/identifier
-                                service_name = inv.client_name
-                                
-                                warning_text = (
-                                    f"⚠️ <b>هشدار حذف سرویس</b>\n"
-                                    f"━━━━━━━━━━━━━━━━━━\n"
-                                    f"📧 سرویس: <code>{service_name}</code>\n"
-                                    f"📅 تاریخ انقضا: {expiry_date.strftime('%Y-%m-%d')}\n"
-                                    f"⏰ مهلت باقیمانده: {days_until_deletion} روز\n\n"
-                                    f"❌ در صورت عدم تمدید، این سرویس پس از اتمام مهلت <b>حذف خواهد شد</b>.\n\n"
-                                    f"💡 برای تمدید از منوی «سرویس‌های من» اقدام کنید."
-                                )
-                                notifications.append((inv.telegram_user_id, warning_text))
-                                inv.deletion_warning_sent_count += 1
-                                db.commit()
-                        
-                        # Check if it's time to delete (deletion date passed AND 3 warnings sent)
-                        if days_until_deletion <= 0 and inv.deletion_warning_sent_count >= 3:
+                            # Get service name/identifier
+                            service_name = inv.client_name
+
+                            warning_text = (
+                                f"⚠️ <b>هشدار حذف سرویس</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"📧 سرویس: <code>{service_name}</code>\n"
+                                f"📅 تاریخ انقضا: {expiry_date.strftime('%Y-%m-%d')}\n"
+                                f"⏰ مهلت باقیمانده: {days_until_deletion} روز\n\n"
+                                f"❌ در صورت عدم تمدید، این سرویس پس از اتمام مهلت <b>حذف خواهد شد</b>.\n\n"
+                                f"💡 برای تمدید از منوی «سرویس‌های من» اقدام کنید."
+                            )
+                            notifications.append((inv.telegram_user_id, warning_text))
+                            inv.deletion_warning_sent_count += 1
+                            db.commit()
+
+                        # Check if it's time to delete. Warnings are best-effort and must
+                        # never block deletion permanently: if missed warnings left the
+                        # count below 3, a hard cap at day 14 guarantees eventual cleanup.
+                        warnings_done = inv.deletion_warning_sent_count >= 3
+                        warning_grace_expired = days_since_expiry >= 14
+                        if days_until_deletion <= 0 and (warnings_done or warning_grace_expired):
                             services_to_delete.append({
                                 'invoice': inv,
                                 'email': inv.client_name,
