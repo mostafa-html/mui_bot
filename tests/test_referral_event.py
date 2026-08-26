@@ -398,3 +398,17 @@ async def test_admin_confirm_blocked_when_event_active():
     with SessionLocal() as db:
         # only the pre-existing event (id=20); no duplicate created
         assert db.query(ReferralEvent).count() == 1
+
+
+def test_event_banner_builder():
+    import bot
+    now = datetime.now(timezone.utc)
+    from database import ReferralEvent
+    ev = ReferralEvent(title='رویداد معرفی', required_invites=3, service_type='amnezia',
+                       amnezia_gb=5, amnezia_days=10,
+                       starts_at=now - HOUR, ends_at=now + timedelta(hours=47))
+    banner = bot.build_event_banner(ev, ev_count=4)
+    assert 'رویداد معرفی' in banner
+    assert '3' in banner and '4' in banner          # goal + progress toward next (6)
+    assert '6' in banner                            # next multiple shown
+    assert '47' in banner                           # countdown hours

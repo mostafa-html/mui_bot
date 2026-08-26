@@ -481,6 +481,18 @@ async def mm_reseller_panel(message: types.Message):
 # ==============================================================================
 # REFERRAL INFO & CLAIM
 # ==============================================================================
+def build_event_banner(event, ev_count: int) -> str:
+    """Pure renderer for the live-event block of the referral screen."""
+    seconds_left = (event.ends_at - datetime.now(timezone.utc)).total_seconds()
+    remaining = max(0, int(-(-seconds_left // 3600)))
+    next_goal = (ev_count // event.required_invites + 1) * event.required_invites
+    return (
+        f"\n🔥 <b>رویداد ویژه: {event.title}</b>\n"
+        f"🎯 {event.required_invites} خرید موفق دوستان در بازه رویداد = یک جایزه رایگان\n"
+        f"📊 پیشرفت رویداد: {ev_count} از {next_goal} — {next_goal - ev_count} خرید تا جایزه بعدی\n"
+        f"⏳ حدود {remaining} ساعت مانده\n"
+    )
+
 async def referral_info_content(user_id: int) -> tuple:
     """Shared logic for referral info. Returns (text, reply_markup)."""
     await ensure_referral_code(user_id)
@@ -494,6 +506,15 @@ async def referral_info_content(user_id: int) -> tuple:
         reward_plan = None
         if reward_plan_id:
             reward_plan = db.query(Plan).filter(Plan.id == int(reward_plan_id.value)).first()
+        event = tasks.get_active_event(db)
+        ev_count = 0
+        if event:
+            ev_count = db.query(Referral).filter(
+                Referral.referrer_id == user_id,
+                Referral.referred_at >= event.starts_at,
+                Referral.paid_at.isnot(None),
+                Referral.paid_at <= event.ends_at).count()
+        event_banner = build_event_banner(event, ev_count) if event else ""
     
     remaining = max(0, threshold - count)
     progress = get_progress_bar(count, threshold, 8) if threshold > 0 else ""
@@ -503,7 +524,8 @@ async def referral_info_content(user_id: int) -> tuple:
         f"🤝 <b>برنامه معرفی و دعوت از دوستان</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"هر دوست که از طریق لینک اختصاصی شما ثبت‌نام کند و سرویس بخرد،"
-        f" یک امتیاز برای شما محسوب می‌شود!\n\n"
+        f" یک امتیاز برای شما محسوب می‌شود!\n"
+        f"{event_banner}\n\n"
         f"🎯 <b>آستانه جایزه:</b> دعوت {threshold} نفر\n"
         f"🎁 <b>پلن جایزه:</b> {reward_plan.name if reward_plan else 'تنظیم نشده'}\n"
         f"\n"
