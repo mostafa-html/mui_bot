@@ -9,7 +9,7 @@ from celery.schedules import crontab
 import redis.asyncio as redis
 import httpx
 from sqlalchemy import text
-from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService, AmneziaTrial
+from database import SessionLocal, Invoice, Plan, TrialUsage, Referral, ReferralCode, AppSetting, Reseller, ResellerPack, AmneziaService, AmneziaTrial, ReferralEvent, ReferralEventReward
 from xui_client import XUIClient
 
 from dotenv import load_dotenv
@@ -348,13 +348,38 @@ def build_bot_db_backup() -> tuple[str, bytes]:
         payload = "\n".join(lines).encode('utf-8')
         return f"botdb_{timestamp}.jsonl", payload
 
-# ----- Helper: mark referral paid and notify referrer -----
+# ----- Referral Events engine -----
+def get_active_event(db):
+    """The single live event (D5: at most one), else None."""
+    now = datetime.now(timezone.utc)
+    return db.query(ReferralEvent).filter(
+        ReferralEvent.is_active == True,
+        ReferralEvent.starts_at <= now,
+        ReferralEvent.ends_at > now
+    ).first()
+
+
+def describe_event_reward(db, event):
+    """Persian description of the event's reward, used across UI + messages."""
+    if event.service_type == 'vless':
+        plan = db.query(Plan).filter(Plan.id == event.vless_plan_id).first()
+        return f"کانفیگ VLESS ({plan.name})" if plan else "کانفیگ VLESS رایگان"
+    return f"کانفیگ Amnezia {event.amnezia_gb:g} گیگابایت {event.amnezia_days} روزه"
+
+
+def _naive_utc(dt):
+    return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
+
+
 def mark_referral_paid(user_id: int):
-    """Mark referral as paid; returns notification info to be sent later in the same event loop."""
+    """Mark referral as paid (+paid_at), credit any live event, return
+    [(telegram_user_id, text)] notifications for callers to deliver."""
+    notifications = []
     with SessionLocal() as db:
         referral = db.query(Referral).filter(Referral.referred_user_id == user_id).first()
         if referral and not referral.became_paid:
             referral.became_paid = True
+            referral.paid_at = datetime.now(timezone.utc)
             db.commit()
             paid_count = db.query(Referral).filter(
                 Referral.referrer_id == referral.referrer_id,
@@ -363,15 +388,48 @@ def mark_referral_paid(user_id: int):
             threshold_setting = db.query(AppSetting).filter(AppSetting.key == 'referral_threshold').first()
             threshold = int(threshold_setting.value) if threshold_setting else 10
             if paid_count >= threshold:
-                return [(referral.referrer_id,
-                    f"🎉 <b>تبریک! یک نفر دیگر از طریق لینک شما سرویس خرید!</b>\n\n"
-                    f"اکنون <b>{paid_count}</b> دعوت موفق دارید و به آستانه {threshold} رسیده‌اید!\n"
-                    f"از منوی «🤝 دعوت از دوستان» جایزه خود را دریافت کنید.")]
+                text = (f"🎉 <b>تبریک! یک نفر دیگر از طریق لینک شما سرویس خرید!</b>\n\n"
+                        f"اکنون <b>{paid_count}</b> دعوت موفق دارید و به آستانه {threshold} رسیده‌اید!\n"
+                        f"از منوی «🤝 دعوت از دوستان» جایزه خود را دریافت کنید.")
             else:
-                return [(referral.referrer_id,
-                    f"🎉 <b>یک نفر از طریق لینک شما سرویس خرید!</b>\n\n"
-                    f"تعداد دعوت‌های موفق شما: <b>{paid_count}</b> از {threshold}")]
-    return []
+                text = (f"🎉 <b>یک نفر از طریق لینک شما سرویس خرید!</b>\n\n"
+                        f"تعداد دعوت‌های موفق شما: <b>{paid_count}</b> از {threshold}")
+
+            # ----- Event hook (spec §3): signup AND payout both inside the window -----
+            event = get_active_event(db)
+            if event:
+                ref_at = _naive_utc(referral.referred_at)
+                starts_at = _naive_utc(event.starts_at)   # naive on sqlite reads
+                if ref_at and ref_at >= starts_at:
+                    ev_count = db.query(Referral).filter(
+                        Referral.referrer_id == referral.referrer_id,
+                        Referral.referred_at >= event.starts_at,
+                        Referral.paid_at.isnot(None),
+                        Referral.paid_at <= event.ends_at
+                    ).count()
+                    granted = db.query(ReferralEventReward).filter(
+                        ReferralEventReward.event_id == event.id,
+                        ReferralEventReward.referrer_id == referral.referrer_id
+                    ).count()
+                    owed = ev_count // event.required_invites
+                    for _ in range(max(0, owed - granted)):
+                        db.add(ReferralEventReward(
+                            event_id=event.id, referrer_id=referral.referrer_id,
+                            granted_at=datetime.now(timezone.utc),
+                            service_type=event.service_type))
+                        db.commit()
+                        provide_event_reward.delay(referral.referrer_id, event.id)
+                    next_goal = (owed + 1) * event.required_invites
+                    text += (f"\n\n🔥 <b>رویداد «{event.title}»:</b> "
+                             f"{ev_count} خرید موفق در رویداد — "
+                             f"{max(0, next_goal - ev_count)} نفر تا جایزه بعدی")
+            notifications.append((referral.referrer_id, text))
+    return notifications
+
+
+@celery_app.task
+def provide_event_reward(user_id: int, event_id: int):  # TEMP — replaced in Task 3
+    raise NotImplementedError
 
 # ----- New tasks -----
 @celery_app.task
