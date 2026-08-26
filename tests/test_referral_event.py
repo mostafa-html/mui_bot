@@ -353,8 +353,10 @@ def test_amnezia_reward_flags_trial_without_entitlement():
         inv = db.query(Invoice).filter(
             Invoice.amnezia_service_id == svc.id).first()
         assert inv is not None and inv.action_type == 'EVENT_REWARD'
+        assert inv.total_price == 0
     assert fake.quota_gb == 5
     assert any(f[1].endswith('.conf') for f in io.docs)
+    assert 8001 in io.calls.get('cache', [])   # post-provision cache invalidation ran
 
 
 def test_admin_event_card_builder():

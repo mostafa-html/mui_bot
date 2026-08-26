@@ -381,6 +381,12 @@ def mark_referral_paid(user_id: int):
             referral.became_paid = True
             referral.paid_at = datetime.now(timezone.utc)
             db.commit()
+            # Per-referrer mutex: serialize concurrent workers between this
+            # point and the grant commit so two processes can never both read
+            # granted=N and double-grant (no-op on SQLite).
+            db.query(Referral).filter(
+                Referral.referrer_id == referral.referrer_id
+            ).with_for_update().first()
             paid_count = db.query(Referral).filter(
                 Referral.referrer_id == referral.referrer_id,
                 Referral.became_paid == True
@@ -418,7 +424,17 @@ def mark_referral_paid(user_id: int):
                             granted_at=datetime.now(timezone.utc),
                             service_type=event.service_type))
                         db.commit()
-                        provide_event_reward.delay(referral.referrer_id, event.id)
+                        try:
+                            provide_event_reward.delay(referral.referrer_id, event.id)
+                        except Exception as dispatch_exc:
+                            logging.error(
+                                f"mark_referral_paid: dispatch failed for event "
+                                f"{event.id} referrer {referral.referrer_id}: {dispatch_exc}")
+                            for admin_id in _admin_ids():
+                                notifications.append((admin_id, (
+                                    f"⚠️ <b>رویداد:</b> جایزه رویداد {event.id} برای کاربر "
+                                    f"<code>{referral.referrer_id}</code> ثبت شد اما ارسال تسک "
+                                    f"ناموفق بود. لطفاً دستی بررسی کنید.")))
                     next_goal = (owed + 1) * event.required_invites
                     text += (f"\n\n🔥 <b>رویداد «{event.title}»:</b> "
                              f"{ev_count} خرید موفق در رویداد — "
@@ -440,6 +456,7 @@ def provide_event_reward(self, user_id: int, event_id: int):
             with SessionLocal() as db:
                 event = db.query(ReferralEvent).filter(ReferralEvent.id == event_id).first()
                 if not event:
+                    logging.error(f"provide_event_reward: event {event_id} not found")
                     return
                 plan = None
                 if event.service_type == 'vless':
@@ -510,7 +527,7 @@ def provide_event_reward(self, user_id: int, event_id: int):
                         client_name=conn_name, action_type='EVENT_REWARD',
                         status='COMPLETE', amnezia_service_id=svc.id))
                     db.commit()
-                    service_id = svc.id
+                await invalidate_cache(user_id)
                 cfg = await amz.get_connection_config(created['server_id'], created['client_id'])
                 vpn_link = cfg.get('vpn_link')
                 config_text = cfg.get('config') or ''
