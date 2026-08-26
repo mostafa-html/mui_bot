@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BotCommand, BufferedInputFile
-from database import SessionLocal, Plan, Invoice, AppSetting, TrialUsage, Coupon, CouponUsage, ReferralCode, Referral, Reseller, ResellerPack, PanelTraffic, TrafficPack, AmneziaUser, AmneziaService, AmneziaTrial
+from database import SessionLocal, Plan, Invoice, AppSetting, TrialUsage, Coupon, CouponUsage, ReferralCode, Referral, ReferralEvent, ReferralEventReward, Reseller, ResellerPack, PanelTraffic, TrafficPack, AmneziaUser, AmneziaService, AmneziaTrial
 from sqlalchemy import func
 import redis.asyncio as redis
 from xui_client import XUIClient, get_xui_client
@@ -145,6 +145,11 @@ class AdminFlow(StatesGroup):
     # Referral
     wait_for_referral_threshold = State()
     wait_for_referral_reward_plan = State()
+    # Referral Event
+    wait_for_event_goal = State()
+    wait_for_event_amz_gb = State()
+    wait_for_event_amz_days = State()
+    wait_for_event_hours = State()
     # Billing
     wait_for_billing_date_range = State()
     # Reseller management
@@ -4702,6 +4707,203 @@ async def save_referral_plan(callback: types.CallbackQuery, state: FSMContext):
         db.commit()
     await state.clear()
     await callback.message.edit_text(f"✅ <b>پلن جایزه با ID {plan_id} انتخاب شد.</b>", reply_markup=get_admin_menu(), parse_mode="HTML")
+
+# ==============================================================================
+# ADMIN: REFERRAL EVENTS
+# ==============================================================================
+def build_admin_event_card(event, participants: int, rewards: int) -> str:
+    remaining = event.ends_at - datetime.now(timezone.utc)
+    hours_left = max(0, int(remaining.total_seconds() // 3600))
+    minutes_left = max(0, int((remaining.total_seconds() % 3600) // 60))
+    with SessionLocal() as db:
+        reward_desc = tasks.describe_event_reward(db, event)
+    return (
+        f"🔥 <b>{event.title}</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 هدف: هر {event.required_invites} خرید موفق = یک جایزه\n"
+        f"🎁 جایزه: {reward_desc}\n"
+        f"⏳ زمان باقی‌مانده: {hours_left} ساعت و {minutes_left} دقیقه\n"
+        f"👥 شرکت‌کنندگان: {participants}\n"
+        f"🏆 جوایز اهدا شده: {rewards}"
+    )
+
+
+def _event_participants_count(db, event) -> int:
+    return db.query(func.count(func.distinct(Referral.referrer_id))).filter(
+        Referral.referred_at >= event.starts_at).scalar() or 0
+
+
+@dp.callback_query(F.data == "admin_referral_event")
+async def admin_referral_event_menu(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    with SessionLocal() as db:
+        event = tasks.get_active_event(db)
+        if event:
+            participants = _event_participants_count(db, event)
+            rewards = db.query(ReferralEventReward).filter(
+                ReferralEventReward.event_id == event.id).count()
+        else:
+            participants = rewards = 0
+    if event:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 پایان زودتر", callback_data="admin_event_end")],
+            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_panel")]])
+        await callback.message.edit_text(build_admin_event_card(event, participants, rewards),
+                                         reply_markup=kb, parse_mode="HTML")
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ ساخت رویداد جدید", callback_data="admin_event_create")],
+            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_panel")]])
+        await callback.message.edit_text("🔥 <b>رویداد معرفی</b>\n\nدر حال حاضر رویداد فعالی وجود ندارد.",
+                                         reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "admin_event_create")
+async def admin_event_create_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    with SessionLocal() as db:
+        if tasks.get_active_event(db):
+            return await callback.answer("یک رویداد فعال وجود دارد. ابتدا آن را پایان دهید.", show_alert=True)
+    await callback.message.edit_text("🔢 <b>تعداد خرید موفق لازم برای هر جایزه را وارد کنید:</b>",
+                                     reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await state.set_state(AdminFlow.wait_for_event_goal)
+
+
+@dp.message(AdminFlow.wait_for_event_goal)
+async def save_event_goal(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        return await message.answer("⚠️ لطفاً یک عدد مثبت وارد کنید.", reply_markup=get_cancel_kb())
+    await state.update_data(ev_goal=int(message.text))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ کانفیگ VLESS", callback_data="admin_event_type_vless"),
+         InlineKeyboardButton(text="🟣 کانفیگ Amnezia", callback_data="admin_event_type_amz")],
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
+    await message.answer("🎁 <b>نوع جایزه را انتخاب کنید:</b>", reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "admin_event_type_vless")
+async def event_pick_vless(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    data = await state.get_data()
+    if 'ev_goal' not in data:
+        return await callback.answer("ابتدا رویداد را از نو بسازید.", show_alert=True)
+    with SessionLocal() as db:
+        plans = db.query(Plan).filter(Plan.is_active == True, Plan.service_type == 'xui').all()
+    if not plans:
+        return await callback.answer("هیچ پلن VLESS فعالی وجود ندارد.", show_alert=True)
+    await state.update_data(ev_service='vless')
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{p.name} (ID: {p.id})", callback_data=f"evplan_{p.id}")] for p in plans
+    ] + [[InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
+    await callback.message.edit_text("🎁 <b>پلن جایزه را انتخاب کنید (حجم و مدت از همین پلن گرفته می‌شود):</b>",
+                                     reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("evplan_"))
+async def event_plan_chosen(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    plan_id = int(callback.data.split("_")[1])
+    await state.update_data(ev_plan_id=plan_id)
+    await callback.message.edit_text("⏱ <b>مدت رویداد به ساعت وارد کنید (مثلاً 48):</b>",
+                                     reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await state.set_state(AdminFlow.wait_for_event_hours)
+
+
+@dp.callback_query(F.data == "admin_event_type_amz")
+async def event_pick_amnezia(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    data = await state.get_data()
+    if 'ev_goal' not in data:
+        return await callback.answer("ابتدا رویداد را از نو بسازید.", show_alert=True)
+    await state.update_data(ev_service='amnezia')
+    await callback.message.edit_text("📦 <b>حجم کانفیگ Amnezia به گیگابایت وارد کنید (مثلاً 5):</b>",
+                                     reply_markup=get_cancel_kb(), parse_mode="HTML")
+    await state.set_state(AdminFlow.wait_for_event_amz_gb)
+
+
+@dp.message(AdminFlow.wait_for_event_amz_gb)
+async def save_event_amz_gb(message: types.Message, state: FSMContext):
+    try:
+        gb = float(message.text.strip().replace(',', '.'))
+        assert gb > 0
+    except Exception:
+        return await message.answer("⚠️ لطفاً یک عدد مثبت وارد کنید.", reply_markup=get_cancel_kb())
+    await state.update_data(ev_amz_gb=gb)
+    await message.answer("⏳ <b>مدت کانفیگ به روز وارد کنید (مثلاً 10):</b>", reply_markup=get_cancel_kb())
+    await state.set_state(AdminFlow.wait_for_event_amz_days)
+
+
+@dp.message(AdminFlow.wait_for_event_amz_days)
+async def save_event_amz_days(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        return await message.answer("⚠️ لطفاً یک عدد مثبت وارد کنید.", reply_markup=get_cancel_kb())
+    await state.update_data(ev_amz_days=int(message.text))
+    await message.answer("⏱ <b>مدت رویداد به ساعت وارد کنید (مثلاً 48):</b>", reply_markup=get_cancel_kb())
+    await state.set_state(AdminFlow.wait_for_event_hours)
+
+
+@dp.message(AdminFlow.wait_for_event_hours)
+async def save_event_hours(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or not (1 <= int(message.text) <= 720):
+        return await message.answer("⚠️ لطفاً عددی بین ۱ تا ۷۲۰ ساعت وارد کنید.", reply_markup=get_cancel_kb())
+    data = await state.get_data()
+    await state.update_data(ev_hours=int(message.text))
+    data['ev_hours'] = int(message.text)
+    if data['ev_service'] == 'vless':
+        with SessionLocal() as db:
+            plan = db.query(Plan).filter(Plan.id == data['ev_plan_id']).first()
+        reward_desc = f"کانفیگ VLESS ({plan.name})" if plan else "کانفیگ VLESS"
+    else:
+        reward_desc = f"کانفیگ Amnezia {data['ev_amz_gb']:g} گیگابایت {data['ev_amz_days']} روزه"
+    text = (f"📋 <b>خلاصه رویداد:</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 هدف: هر {data['ev_goal']} خرید موفق = یک جایزه\n"
+            f"🎁 جایزه: {reward_desc}\n"
+            f"⏱ مدت: {data['ev_hours']} ساعت (شروع: بلافاصله)\n\n"
+            f"تأیید می‌کنید؟")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ تأیید و شروع", callback_data="admin_event_confirm")],
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="cancel")]])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "admin_event_confirm")
+async def admin_event_confirm(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    data = await state.get_data()
+    if 'ev_goal' not in data or 'ev_service' not in data or 'ev_hours' not in data:
+        return await callback.answer("اطلاعات ناقص است. دوباره تلاش کنید.", show_alert=True)
+    with SessionLocal() as db:
+        if tasks.get_active_event(db):                      # defensive re-check (spec §7)
+            await state.clear()
+            return await callback.message.edit_text("⚠️ یک رویداد فعال از قبل وجود دارد.",
+                                                    reply_markup=get_admin_menu(), parse_mode="HTML")
+        now = datetime.now(timezone.utc)
+        event = ReferralEvent(
+            title="رویداد معرفی",
+            required_invites=data['ev_goal'],
+            service_type=data['ev_service'],
+            vless_plan_id=data.get('ev_plan_id'),
+            amnezia_gb=data.get('ev_amz_gb'),
+            amnezia_days=data.get('ev_amz_days'),
+            starts_at=now, ends_at=now + timedelta(hours=data['ev_hours']),
+            is_active=True)
+        db.add(event)
+        db.commit()
+    await state.clear()
+    await callback.message.edit_text(
+        f"🔥 <b>رویداد شروع شد!</b>\nکاربران از منوی «🤝 دعوت از دوستان» پیشرفت خود را می‌بینند.",
+        reply_markup=get_admin_menu(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "admin_event_end")
+async def admin_event_end(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in get_admin_ids(): return
+    with SessionLocal() as db:
+        event = tasks.get_active_event(db)
+        if event:
+            event.is_active = False
+            db.commit()
+    await callback.message.edit_text("🛑 <b>رویداد پایان یافت.</b>\nدیگر خریدی شمرده نمی‌شود.",
+                                     reply_markup=get_admin_menu(), parse_mode="HTML")
 
 # ==============================================================================
 # ADMIN: BROADCAST (message to all bot users)

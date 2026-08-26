@@ -355,3 +355,46 @@ def test_amnezia_reward_flags_trial_without_entitlement():
         assert inv is not None and inv.action_type == 'EVENT_REWARD'
     assert fake.quota_gb == 5
     assert any(f[1].endswith('.conf') for f in io.docs)
+
+
+def test_admin_event_card_builder():
+    import bot
+    now = datetime.now(timezone.utc)
+    from database import ReferralEvent
+    ev = ReferralEvent(id=1, title='رویداد معرفی', required_invites=3,
+                       service_type='vless', vless_plan_id=5,
+                       starts_at=now - HOUR, ends_at=now + timedelta(hours=47))
+    card = bot.build_admin_event_card(ev, participants=7, rewards=2)
+    assert 'رویداد معرفی' in card and '3' in card and '47' in card
+    assert '7' in card and '2' in card
+
+
+class _FakeCb:
+    """Callback stand-in with admin identity (ADMIN_CHAT_IDS=111 in bootstrap)."""
+    def __init__(self):
+        from types import SimpleNamespace
+        self.from_user = SimpleNamespace(id=111)
+
+        class _Msg:
+            async def edit_text(self, *a, **k):
+                pass
+            async def answer(self, *a, **k):
+                pass
+        self.message = _Msg()
+
+
+async def test_admin_confirm_blocked_when_event_active():
+    _clean_referral_tables()
+    now = datetime.now(timezone.utc)
+    _seed_event(ev_id=20, start=now - HOUR)           # an event is already live
+    import asyncio
+    from tests._bootstrap import FakeState
+    from database import SessionLocal, ReferralEvent
+    state = FakeState({'ev_goal': 2, 'ev_service': 'vless', 'ev_plan_id': 5,
+                       'ev_hours': 48})
+    import bot
+    cb = _FakeCb()
+    await asyncio.wait_for(bot.admin_event_confirm(cb, state), timeout=10)
+    with SessionLocal() as db:
+        # only the pre-existing event (id=20); no duplicate created
+        assert db.query(ReferralEvent).count() == 1

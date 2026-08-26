@@ -89,6 +89,7 @@ ADMIN_CATEGORIES = {
         ("🎫 کدهای تخفیف", "admin_coupon_menu"),
         ("🎁 تنظیمات تست رایگان", "admin_trial_settings"),
         ("🤝 تنظیمات معرفی", "admin_referral_settings"),
+        ("🔥 رویداد معرفی", "admin_referral_event"),
     ]),
     "admcat_invoices": ("🧾 فاکتور و پرداخت", [
         ("🔄 بازبینی فاکتورها", "admin_retry_invoices"),
