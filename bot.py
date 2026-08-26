@@ -1519,16 +1519,38 @@ async def amz_server_selected(callback: types.CallbackQuery, state: FSMContext):
         "▫️ اگر فقط نام کاربری بفرستید، رمز به صورت خودکار ساخته می‌شود\n"
         "▫️ نام کاربری: حروف انگلیسی/عدد/زیرخط (۳ تا ۳۲ کاراکتر)\n"
         "▫️ رمز عبور: حداقل ۶ کاراکتر\n\n"
-        "💡 اگر این مرحله را رد کنید، حساب به صورت خودکار ساخته می‌شود.",
+        "💡 اگر این مرحله را رد کنید، حساب به‌صورت خودکار و بر اساس نام تلگرام شما ساخته می‌شود.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⏭ رد شدن و ساخت خودکار", callback_data="amzskipcreds")]
         ]), parse_mode="HTML"
     )
     await state.set_state(BuyFlow.wait_for_amz_account)
 
+def _sanitize_panel_username(raw: str) -> str | None:
+    """Panel-safe username or None: [A-Za-z0-9_], 3..24 chars."""
+    s = re.sub(r'[^A-Za-z0-9_]+', '_', (raw or '').strip()).strip('_')
+    if len(s) < 3:
+        return None
+    return s[:24]
+
+
+def _auto_amz_base(from_user) -> str | None:
+    """Auto Amnezia account base: Telegram display name first,
+    @username second; None lets provisioning fall back to tg_<id>."""
+    name = ' '.join(x for x in (
+        getattr(from_user, 'first_name', '') or '',
+        getattr(from_user, 'last_name', '') or '',
+    ) if x)
+    return _sanitize_panel_username(name) or \
+        _sanitize_panel_username(getattr(from_user, 'username', '') or '')
+
+
 @dp.callback_query(BuyFlow.wait_for_amz_account, F.data == "amzskipcreds")
 async def amz_skip_creds(callback: types.CallbackQuery, state: FSMContext):
-    await state.update_data(amz_username=None, amz_password=None)
+    # Auto creation still personalises the username: Telegram display name,
+    # then @username; provisioning falls back to tg_<id> when neither fits.
+    await state.update_data(amz_username=_auto_amz_base(callback.from_user),
+                            amz_password=None)
     await cleanup_prev_message(bot, state, callback.message.chat.id)
     await _amz_send_coupon_step(callback.message, state)
 

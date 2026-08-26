@@ -525,3 +525,26 @@ def test_finished_event_auto_report_exactly_once():
     finally:
         tasks.notify_many_users = orig
     assert len(sent) == 1                                 # exactly-once held
+
+
+def test_auto_amz_base_prefers_name_then_username():
+    import bot
+    from types import SimpleNamespace as NS
+    # English display name wins
+    u = NS(first_name='Ali', last_name='Ahmadi', username='ali_gh', id=555)
+    assert bot._auto_amz_base(u) == 'Ali_Ahmadi'
+    # unusable (non-Latin) name falls back to @username
+    u = NS(first_name='علی', last_name='', username='ali_gh', id=555)
+    assert bot._auto_amz_base(u) == 'ali_gh'
+    # neither present → None (provisioning falls back to tg_<id>)
+    u = NS(first_name='', last_name=None, username=None, id=555)
+    assert bot._auto_amz_base(u) is None
+    # too-short name falls through to username
+    u = NS(first_name='A', last_name='', username='bob', id=555)
+    assert bot._auto_amz_base(u) == 'bob'
+    # junk characters collapsed, trimmed of underscores
+    u = NS(first_name='M@hdi!!', last_name='', username='fallback9', id=1)
+    assert bot._auto_amz_base(u) == 'M_hdi'
+    # long names truncated to panel-safe 24 chars
+    u = NS(first_name='a' * 40, last_name='', username='x', id=1)
+    assert bot._auto_amz_base(u) == 'a' * 24
