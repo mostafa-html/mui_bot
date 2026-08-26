@@ -113,6 +113,29 @@ class Referral(Base):
     referred_user_id = Column(BigInteger, unique=True, nullable=False)
     referred_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     became_paid = Column(Boolean, default=False)
+    paid_at = Column(DateTime(timezone=True), nullable=True)  # set once in mark_referral_paid
+
+class ReferralEvent(Base):
+    __tablename__ = "referral_events"
+    id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    title = Column(String, nullable=False, default="رویداد معرفی")
+    required_invites = Column(Integer, nullable=False)
+    service_type = Column(String, nullable=False)  # 'vless' | 'amnezia'
+    vless_plan_id = Column(BigInteger, ForeignKey('plans.id'), nullable=True)
+    amnezia_gb = Column(Integer, nullable=True)     # whole GB; sub-GB rounded up at provisioning
+    amnezia_days = Column(Integer, nullable=True)
+    starts_at = Column(DateTime(timezone=True), nullable=False)
+    ends_at = Column(DateTime(timezone=True), nullable=False)
+    is_active = Column(Boolean, default=True)
+
+
+class ReferralEventReward(Base):
+    __tablename__ = "referral_event_rewards"
+    id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    event_id = Column(BigInteger, ForeignKey('referral_events.id'), nullable=False, index=True)
+    referrer_id = Column(BigInteger, nullable=False, index=True)
+    granted_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    service_type = Column(String, nullable=False)
 
 class Reseller(Base):
     __tablename__ = "resellers"
@@ -281,6 +304,15 @@ def run_migrations():
         if 'amnezia_service_id' not in invoice_col_names:
             with engine.connect() as conn:
                 conn.execute(text("ALTER TABLE invoices ADD COLUMN amnezia_service_id INTEGER"))
+                conn.commit()
+
+    # Referral events: when each invitee actually paid (window filtering)
+    if 'referrals' in existing_tables:
+        referral_cols = [col['name'] for col in inspector.get_columns('referrals')]
+        if 'paid_at' not in referral_cols:
+            paid_at_type = 'DATETIME' if IS_SQLITE else 'TIMESTAMPTZ'
+            with engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE referrals ADD COLUMN paid_at {paid_at_type}"))
                 conn.commit()
 
     # Create reseller_packs table if it doesn't exist (handled by create_all, but ensure any missing columns)
