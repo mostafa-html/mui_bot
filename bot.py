@@ -629,8 +629,17 @@ async def claim_reward(callback: types.CallbackQuery):
             return
         
         plan_id = plan.id
-        rec.reward_claimed = True
+        # Atomic claim: only flip reward_claimed if it is still unset, so two
+        # rapid taps can never both pass the guard and dispatch the reward
+        # twice (same CAS discipline as invoice approval below).
+        rows = db.query(ReferralCode).filter(
+            ReferralCode.telegram_user_id == callback.from_user.id,
+            ReferralCode.reward_claimed == False
+        ).update({"reward_claimed": True})
         db.commit()
+        if rows == 0:
+            await callback.answer("شما قبلاً جایزه خود را دریافت کرده‌اید.", show_alert=True)
+            return
     
     tasks.provide_referral_reward.delay(callback.from_user.id, plan_id)
     try:
@@ -3854,6 +3863,10 @@ async def admin_reject_reason(message: types.Message, state: FSMContext):
     with SessionLocal() as db:
         invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
         invoice.status = "REJECTED"
+        # A rejected purchase never happens, so give the coupon usage back:
+        # CouponUsage rows were booked at receipt time and would otherwise
+        # permanently burn max_uses_total / max_uses_per_user quota.
+        db.query(CouponUsage).filter(CouponUsage.invoice_id == invoice_id).delete()
         db.commit()
         # Capture before the session closes (commit expires the instance)
         target_user_id = invoice.telegram_user_id

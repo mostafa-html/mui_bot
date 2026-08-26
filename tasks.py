@@ -3,6 +3,8 @@ import time
 import asyncio
 import json
 import logging
+import random
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from celery import Celery
 from celery.schedules import crontab
@@ -102,6 +104,61 @@ def alert_on_task_failure(sender=None, task_id=None, exception=None,
         logging.error("failed to deliver task-failure alert", exc_info=True)
 
 REDIS_URL = os.getenv('REDIS_URL')
+
+# ---------------------------------------------------------------------------
+# Per-service update lock
+#
+# Renew/topup tasks do read-panel -> compute -> write-panel. Two overlapping
+# executions for the same service (a re-dispatched invoice, or a user's renew
+# and topup bought seconds apart) both read the same panel state and the last
+# writer wins — silently LOSING the other run's paid increment. This lock
+# serializes that critical section per service.
+#
+# Deliberately best-effort in one direction only: if Redis itself is down we
+# proceed unlocked (logged loudly) so provisioning never hard-depends on Redis;
+# but a lock that is HELD and not freed in time raises, which the caller's
+# autoretry_for turns into a backoff retry instead of a lost increment.
+# ---------------------------------------------------------------------------
+_LOCK_RELEASE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+@asynccontextmanager
+async def panel_update_lock(key: str, ttl: int = 60, wait: float = 15.0):
+    """Async context manager: exclusive access to one service's panel state.
+
+    ``ttl`` auto-expires a holder that crashed mid-write (no deadlock);
+    ``wait`` bounds how long a second task queues before failing loudly."""
+    name = f"lock:panel:{key}"
+    token = f"{time.time()}:{random.randrange(2**32)}"
+    r = None
+    try:
+        r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        deadline = time.monotonic() + wait
+        while not await r.set(name, token, nx=True, ex=ttl):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"panel_update_lock busy: {key}")
+            await asyncio.sleep(0.25)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logging.warning(f"panel_update_lock unavailable ({e}); proceeding UNLOCKED for {key}")
+        r = None
+    try:
+        yield
+    finally:
+        if r is not None:
+            try:
+                await r.eval(_LOCK_RELEASE_LUA, 1, name, token)
+            except Exception:
+                pass
+            try:
+                await r.aclose()
+            except Exception:
+                pass
 
 async def edit_telegram_message(chat_id, message_id, text):
     bot_token = os.getenv('BOT_TOKEN')
@@ -1222,138 +1279,150 @@ def provision_new(self, invoice_id: int, inbound_ids: list):
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def provision_renew(self, invoice_id: int, email: str):
+    """Renewal serializes per panel email: the read-modify-write below loses
+    the paid increment if two runs overlap."""
     async def _run():
-        try:
-            # Fetch invoice and plan, store needed data
-            with SessionLocal() as db:
-                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                if not invoice:
-                    return
-                if invoice.status == "COMPLETE":
-                    return
-                plan = db.query(Plan).filter(Plan.id == invoice.plan_id).first()
-                if not plan:
-                    invoice.status = "FAILED"
-                    db.commit()
-                    await notify_user(invoice.telegram_user_id, "❌ پلن مربوطه یافت نشد.")
-                    return
-                user_id = invoice.telegram_user_id
-                plan_name = plan.name
-                traffic_gb = plan.traffic_gb
-                duration_days = plan.duration_days
-
-            xui = XUIClient()
-            full_client_response = await xui.get_client_full(email)
-            client_payload = full_client_response.get('client', {})
-            
-            now_ms = int(time.time() * 1000)
-            used = full_client_response.get('usedTraffic', 0)
-            remaining_bytes = max(0, client_payload.get('totalGB', 0) - used)
-            remaining_days_ms = max(0, client_payload.get('expiryTime', 0) - now_ms)
-            
-            new_total_bytes = remaining_bytes + (traffic_gb * 1024 ** 3)
-            new_expiry_ms = now_ms + remaining_days_ms + (duration_days * 86400 * 1000)
-
-            update_payload = {
-                "email": email,
-                "totalGB": new_total_bytes,
-                "expiryTime": new_expiry_ms,
-                "tgId": client_payload.get('tgId', 0),
-                "enable": True
-            }
-            
-            await xui.update_client(email, update_payload)
-            await xui.reset_client_traffic(email)
-            await invalidate_cache(user_id)
-            
-            with SessionLocal() as db:
-                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                if invoice:
-                    invoice.status = "COMPLETE"
-                    db.commit()
-            
-            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"], f"🔄 <b>تمدید سرویس <code>{email}</code> با موفقیت انجام شد!</b> 🌟")
-            
-            referral_notifications = mark_referral_paid(user_id)
-            
-            sub_link = await get_sub_link(email)
-            link_text = f"\n\n🔗 <b>لینک اتصال شما:</b>\n<code>{sub_link}</code>" if sub_link else "\n\n⚠️ لینک اتصال هنوز تنظیم نشده است. لطفاً به منوی سرویس‌های من مراجعه کنید."
-            notifications = referral_notifications + [
-                (user_id,
-                 f"🔄 <b>سرویس شما برای <code>{email}</code> با موفقیت تمدید شد!</b>\n\n"
-                 f"📦 پلن: {plan_name}\n"
-                 f"⏳ مدت: {duration_days} روز\n"
-                 f"📶 حجم: {traffic_gb} GB\n"
-                 f"{link_text}", MSG_EFFECT_FIRE)
-            ]
-            admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
-            for aid in admin_ids:
-                notifications.append((aid, f"✅ <b>تمدید انجام شد</b>\n📦 <b>پلن:</b> {plan_name}\n🔗 <b>سرویس:</b> <code>{email}</code>"))
-            
-            await notify_many_users(notifications)
-        except Exception as e:
-            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"], f"❌ <b>خطا در تمدید:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
-            raise
+        async with panel_update_lock(f"xui:{email}"):
+            await _renew_body(invoice_id, email)
     run_async(_run())
+
+async def _renew_body(invoice_id: int, email: str):
+    try:
+        # Fetch invoice and plan, store needed data
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if not invoice:
+                return
+            if invoice.status == "COMPLETE":
+                return
+            plan = db.query(Plan).filter(Plan.id == invoice.plan_id).first()
+            if not plan:
+                invoice.status = "FAILED"
+                db.commit()
+                await notify_user(invoice.telegram_user_id, "❌ پلن مربوطه یافت نشد.")
+                return
+            user_id = invoice.telegram_user_id
+            plan_name = plan.name
+            traffic_gb = plan.traffic_gb
+            duration_days = plan.duration_days
+
+        xui = XUIClient()
+        full_client_response = await xui.get_client_full(email)
+        client_payload = full_client_response.get('client', {})
+        
+        now_ms = int(time.time() * 1000)
+        used = full_client_response.get('usedTraffic', 0)
+        remaining_bytes = max(0, client_payload.get('totalGB', 0) - used)
+        remaining_days_ms = max(0, client_payload.get('expiryTime', 0) - now_ms)
+        
+        new_total_bytes = remaining_bytes + (traffic_gb * 1024 ** 3)
+        new_expiry_ms = now_ms + remaining_days_ms + (duration_days * 86400 * 1000)
+
+        update_payload = {
+            "email": email,
+            "totalGB": new_total_bytes,
+            "expiryTime": new_expiry_ms,
+            "tgId": client_payload.get('tgId', 0),
+            "enable": True
+        }
+        
+        await xui.update_client(email, update_payload)
+        await xui.reset_client_traffic(email)
+        await invalidate_cache(user_id)
+        
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if invoice:
+                invoice.status = "COMPLETE"
+                db.commit()
+        
+        await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"], f"🔄 <b>تمدید سرویس <code>{email}</code> با موفقیت انجام شد!</b> 🌟")
+        
+        referral_notifications = mark_referral_paid(user_id)
+        
+        sub_link = await get_sub_link(email)
+        link_text = f"\n\n🔗 <b>لینک اتصال شما:</b>\n<code>{sub_link}</code>" if sub_link else "\n\n⚠️ لینک اتصال هنوز تنظیم نشده است. لطفاً به منوی سرویس‌های من مراجعه کنید."
+        notifications = referral_notifications + [
+            (user_id,
+             f"🔄 <b>سرویس شما برای <code>{email}</code> با موفقیت تمدید شد!</b>\n\n"
+             f"📦 پلن: {plan_name}\n"
+             f"⏳ مدت: {duration_days} روز\n"
+             f"📶 حجم: {traffic_gb} GB\n"
+             f"{link_text}", MSG_EFFECT_FIRE)
+        ]
+        admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+        for aid in admin_ids:
+            notifications.append((aid, f"✅ <b>تمدید انجام شد</b>\n📦 <b>پلن:</b> {plan_name}\n🔗 <b>سرویس:</b> <code>{email}</code>"))
+        
+        await notify_many_users(notifications)
+    except Exception as e:
+        await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"], f"❌ <b>خطا در تمدید:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        raise
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def provision_topup(self, invoice_id: int, email: str):
+    """Top-up serializes per panel email: same last-writer-wins risk as renew."""
     async def _run():
-        try:
-            # Fetch invoice, store needed data
-            with SessionLocal() as db:
-                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                if not invoice:
-                    return
-                if invoice.status == "COMPLETE":
-                    return
-                user_id = invoice.telegram_user_id
-                added_gb = invoice.added_gb or 0
-
-            xui = XUIClient()
-            full_client_response = await xui.get_client_full(email)
-            client_payload = full_client_response.get('client', {})
-            
-            added_bytes = added_gb * (1024 ** 3)
-            new_total_bytes = client_payload.get('totalGB', 0) + added_bytes
-            
-            update_payload = {
-                "email": email,
-                "totalGB": new_total_bytes,
-                "expiryTime": client_payload.get('expiryTime', 0),
-                "tgId": client_payload.get('tgId', 0),
-                "enable": True
-            }
-            
-            await xui.update_client(email, update_payload)
-            await invalidate_cache(user_id)
-            
-            with SessionLocal() as db:
-                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                if invoice:
-                    invoice.status = "COMPLETE"
-                    db.commit()
-            
-            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"], f"➕ <b>{added_gb} گیگابایت با موفقیت به <code>{email}</code> اضافه شد!</b> 🎉")
-            
-            referral_notifications = mark_referral_paid(user_id)
-            
-            sub_link = await get_sub_link(email)
-            link_text = f"\n\n🔗 <b>لینک اتصال شما:</b>\n<code>{sub_link}</code>" if sub_link else "\n\n⚠️ لینک اتصال هنوز تنظیم نشده است. لطفاً به منوی سرویس‌های من مراجعه کنید."
-            notifications = referral_notifications + [
-                (user_id, 
-                 f"➕ <b>مقدار {added_gb} گیگابایت با موفقیت به <code>{email}</code> اضافه شد!</b>\n\n"
-                 f"{link_text}")
-            ]
-            admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
-            for aid in admin_ids:
-                notifications.append((aid, f"✅ <b>خرید حجم انجام شد</b> ({added_gb}GB) برای <code>{email}</code>"))
-            
-            await notify_many_users(notifications)
-        except Exception as e:
-            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"], f"❌ <b>خطا در افزودن حجم:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
-            raise
+        async with panel_update_lock(f"xui:{email}"):
+            await _topup_body(invoice_id, email)
     run_async(_run())
+
+async def _topup_body(invoice_id: int, email: str):
+    try:
+        # Fetch invoice, store needed data
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if not invoice:
+                return
+            if invoice.status == "COMPLETE":
+                return
+            user_id = invoice.telegram_user_id
+            added_gb = invoice.added_gb or 0
+
+        xui = XUIClient()
+        full_client_response = await xui.get_client_full(email)
+        client_payload = full_client_response.get('client', {})
+        
+        added_bytes = added_gb * (1024 ** 3)
+        new_total_bytes = client_payload.get('totalGB', 0) + added_bytes
+        
+        update_payload = {
+            "email": email,
+            "totalGB": new_total_bytes,
+            "expiryTime": client_payload.get('expiryTime', 0),
+            "tgId": client_payload.get('tgId', 0),
+            "enable": True
+        }
+        
+        await xui.update_client(email, update_payload)
+        await invalidate_cache(user_id)
+        
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if invoice:
+                invoice.status = "COMPLETE"
+                db.commit()
+        
+        await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"], f"➕ <b>{added_gb} گیگابایت با موفقیت به <code>{email}</code> اضافه شد!</b> 🎉")
+        
+        referral_notifications = mark_referral_paid(user_id)
+        
+        sub_link = await get_sub_link(email)
+        link_text = f"\n\n🔗 <b>لینک اتصال شما:</b>\n<code>{sub_link}</code>" if sub_link else "\n\n⚠️ لینک اتصال هنوز تنظیم نشده است. لطفاً به منوی سرویس‌های من مراجعه کنید."
+        notifications = referral_notifications + [
+            (user_id, 
+             f"➕ <b>مقدار {added_gb} گیگابایت با موفقیت به <code>{email}</code> اضافه شد!</b>\n\n"
+             f"{link_text}")
+        ]
+        admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+        for aid in admin_ids:
+            notifications.append((aid, f"✅ <b>خرید حجم انجام شد</b> ({added_gb}GB) برای <code>{email}</code>"))
+        
+        await notify_many_users(notifications)
+    except Exception as e:
+        await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"], f"❌ <b>خطا در افزودن حجم:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        raise
+
 
 # ----- Regular user service deletion -----
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
@@ -2116,145 +2185,160 @@ def provision_amnezia_new(self, invoice_id: int):
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def provision_amnezia_renew(self, invoice_id: int):
-    """Renew: unused traffic carries over, plan GB is added, expiry extends."""
+    """Renewal serializes per service id: read-stats -> compute -> write must
+    not overlap another run for the same service."""
     async def _run():
-        try:
-            with SessionLocal() as db:
-                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                if not invoice or invoice.status == "COMPLETE":
-                    return
-                plan = db.query(Plan).filter(Plan.id == invoice.plan_id).first()
-                svc = db.query(AmneziaService).filter(
-                    AmneziaService.id == invoice.amnezia_service_id).first()
-                if not plan or not svc:
-                    invoice.status = "FAILED"
-                    db.commit()
-                    await notify_user(invoice.telegram_user_id, "❌ سرویس یا پلن مربوطه یافت نشد.")
-                    return
-                user_id = invoice.telegram_user_id
-                service_id = svc.id
-                panel_user_id, panel_username = svc.panel_user_id, svc.panel_username
-
-            amz = AmneziaClient()
-            try:
-                if not panel_user_id or not panel_username:
-                    raise RuntimeError(f"service {service_id} has no dedicated panel account")
-                stats = await amz.get_user_stats(panel_username)
-                if stats is None:
-                    raise RuntimeError(f"panel user {panel_username} not found")
-                now = datetime.now(timezone.utc)
-                remaining_gb = max(0, round((stats['limit'] - stats['used']) / (1024 ** 3)))
-                new_limit_gb = remaining_gb + plan.traffic_gb
-                current_exp = stats['expiration_date']
-                base = max(now, current_exp) if current_exp else now
-                new_exp = base + timedelta(days=plan.duration_days)
-                await amz.update_user_limits(panel_user_id, user_id,
-                                             quota_gb=new_limit_gb, expiry=new_exp)
-                with SessionLocal() as db:
-                    svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
-                    if svc:
-                        svc.quota_bytes = new_limit_gb * 1024 ** 3
-                        svc.expiry_date = new_exp
-                        svc.status = 'active'
-                        svc.expiry_warned_at = None
-                    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                    if invoice:
-                        invoice.status = "COMPLETE"
-                    db.commit()
-                await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
-                                              f"🔄 <b>تمدید سرویس Amnezia با موفقیت انجام شد!</b> 🌟")
-                referral_notifications = mark_referral_paid(user_id)
-                notifications = referral_notifications + [
-                    (user_id,
-                     f"🔄 <b>سرویس Amnezia شما تمدید شد!</b>\n\n"
-                     f"📦 حجم افزوده‌شده: {plan.traffic_gb} GB\n"
-                     f"⏳ مدت افزوده‌شده: {plan.duration_days} روز\n"
-                     f"📅 انقضای جدید: {new_exp.strftime('%Y-%m-%d')}",
-                     MSG_EFFECT_FIRE)
-                ]
-                admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
-                for aid in admin_ids:
-                    notifications.append((aid,
-                        f"✅ <b>تمدید Amnezia انجام شد</b>\n👤 <code>{user_id}</code> | 📦 {plan.name} | 📄 #{invoice_id}"))
-                await notify_many_users(notifications)
-            finally:
-                await amz.close()
-        except Exception as e:
-            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
-                                          f"❌ <b>خطا در تمدید سرویس Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
-            raise
+        with SessionLocal() as db:
+            inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            svc_id = inv.amnezia_service_id if inv else None
+        async with panel_update_lock(f"amz-svc:{svc_id or invoice_id}"):
+            await _amz_renew_body(invoice_id)
     run_async(_run())
 
+async def _amz_renew_body(invoice_id):
+    try:
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if not invoice or invoice.status == "COMPLETE":
+                return
+            plan = db.query(Plan).filter(Plan.id == invoice.plan_id).first()
+            svc = db.query(AmneziaService).filter(
+                AmneziaService.id == invoice.amnezia_service_id).first()
+            if not plan or not svc:
+                invoice.status = "FAILED"
+                db.commit()
+                await notify_user(invoice.telegram_user_id, "❌ سرویس یا پلن مربوطه یافت نشد.")
+                return
+            user_id = invoice.telegram_user_id
+            service_id = svc.id
+            panel_user_id, panel_username = svc.panel_user_id, svc.panel_username
+
+        amz = AmneziaClient()
+        try:
+            if not panel_user_id or not panel_username:
+                raise RuntimeError(f"service {service_id} has no dedicated panel account")
+            stats = await amz.get_user_stats(panel_username)
+            if stats is None:
+                raise RuntimeError(f"panel user {panel_username} not found")
+            now = datetime.now(timezone.utc)
+            remaining_gb = max(0, round((stats['limit'] - stats['used']) / (1024 ** 3)))
+            new_limit_gb = remaining_gb + plan.traffic_gb
+            current_exp = stats['expiration_date']
+            base = max(now, current_exp) if current_exp else now
+            new_exp = base + timedelta(days=plan.duration_days)
+            await amz.update_user_limits(panel_user_id, user_id,
+                                         quota_gb=new_limit_gb, expiry=new_exp)
+            with SessionLocal() as db:
+                svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
+                if svc:
+                    svc.quota_bytes = new_limit_gb * 1024 ** 3
+                    svc.expiry_date = new_exp
+                    svc.status = 'active'
+                    svc.expiry_warned_at = None
+                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                if invoice:
+                    invoice.status = "COMPLETE"
+                db.commit()
+            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
+                                          f"🔄 <b>تمدید سرویس Amnezia با موفقیت انجام شد!</b> 🌟")
+            referral_notifications = mark_referral_paid(user_id)
+            notifications = referral_notifications + [
+                (user_id,
+                 f"🔄 <b>سرویس Amnezia شما تمدید شد!</b>\n\n"
+                 f"📦 حجم افزوده‌شده: {plan.traffic_gb} GB\n"
+                 f"⏳ مدت افزوده‌شده: {plan.duration_days} روز\n"
+                 f"📅 انقضای جدید: {new_exp.strftime('%Y-%m-%d')}",
+                 MSG_EFFECT_FIRE)
+            ]
+            admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+            for aid in admin_ids:
+                notifications.append((aid,
+                    f"✅ <b>تمدید Amnezia انجام شد</b>\n👤 <code>{user_id}</code> | 📦 {plan.name} | 📄 #{invoice_id}"))
+            await notify_many_users(notifications)
+        finally:
+            await amz.close()
+    except Exception as e:
+        await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
+                                      f"❌ <b>خطا در تمدید سرویس Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        raise
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def provision_amnezia_topup(self, invoice_id: int):
-    """Top-up: adds volume only; expiry and remaining traffic are untouched."""
+    """Top-up serializes per service id: same overlap risk as amnezia renew."""
     async def _run():
-        try:
-            with SessionLocal() as db:
-                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                if not invoice or invoice.status == "COMPLETE":
-                    return
-                svc = db.query(AmneziaService).filter(
-                    AmneziaService.id == invoice.amnezia_service_id).first()
-                if not svc:
-                    invoice.status = "FAILED"
-                    db.commit()
-                    await notify_user(invoice.telegram_user_id, "❌ سرویس مربوطه یافت نشد.")
-                    return
-                if (svc.quota_bytes or 0) == 0:
-                    # Unlimited service: topping up would CAP the account-wide
-                    # panel quota to the purchased GB. Refuse and refund nothing
-                    # (invoice stays PENDING for admin review).
-                    invoice.status = "NEEDS_REVIEW"
-                    db.commit()
-                    await notify_user(invoice.telegram_user_id,
-                        "♾️ این سرویس نامحدود است؛ خرید حجم اضافه روی آن امکان‌پذیر نیست. "
-                        "لطفاً با پشتیبانی تماس بگیرید.")
-                    return
-                user_id = invoice.telegram_user_id
-                added_gb = invoice.added_gb or 0
-                service_id = svc.id
-                panel_user_id, panel_username = svc.panel_user_id, svc.panel_username
-
-            amz = AmneziaClient()
-            try:
-                if not panel_user_id or not panel_username:
-                    raise RuntimeError(f"service {service_id} has no dedicated panel account")
-                stats = await amz.get_user_stats(panel_username)
-                if stats is None:
-                    raise RuntimeError(f"panel user {panel_username} not found")
-                current_limit_gb = round(stats['limit'] / (1024 ** 3))
-                new_limit_gb = current_limit_gb + added_gb
-                await amz.update_user_limits(panel_user_id, user_id,
-                                             quota_gb=new_limit_gb)
-                with SessionLocal() as db:
-                    svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
-                    if svc:
-                        svc.quota_bytes = new_limit_gb * 1024 ** 3
-                        svc.status = 'active'
-                    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-                    if invoice:
-                        invoice.status = "COMPLETE"
-                    db.commit()
-                await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
-                                              f"➕ <b>{added_gb} گیگابایت با موفقیت به سرویس Amnezia شما اضافه شد!</b> 🎉")
-                referral_notifications = mark_referral_paid(user_id)
-                notifications = referral_notifications + [
-                    (user_id, f"➕ <b>{added_gb} گیگابایت به سرویس Amnezia شما اضافه شد!</b>")
-                ]
-                admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
-                for aid in admin_ids:
-                    notifications.append((aid,
-                        f"✅ <b>خرید حجم Amnezia انجام شد</b> ({added_gb}GB) برای <code>{user_id}</code> | 📄 #{invoice_id}"))
-                await notify_many_users(notifications)
-            finally:
-                await amz.close()
-        except Exception as e:
-            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
-                                          f"❌ <b>خطا در افزودن حجم Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
-            raise
+        with SessionLocal() as db:
+            inv = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            svc_id = inv.amnezia_service_id if inv else None
+        async with panel_update_lock(f"amz-svc:{svc_id or invoice_id}"):
+            await _amz_topup_body(invoice_id)
     run_async(_run())
+
+async def _amz_topup_body(invoice_id: int):
+    try:
+        with SessionLocal() as db:
+            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+            if not invoice or invoice.status == "COMPLETE":
+                return
+            svc = db.query(AmneziaService).filter(
+                AmneziaService.id == invoice.amnezia_service_id).first()
+            if not svc:
+                invoice.status = "FAILED"
+                db.commit()
+                await notify_user(invoice.telegram_user_id, "❌ سرویس مربوطه یافت نشد.")
+                return
+            if (svc.quota_bytes or 0) == 0:
+                # Unlimited service: topping up would CAP the account-wide
+                # panel quota to the purchased GB. Refuse and refund nothing
+                # (invoice stays PENDING for admin review).
+                invoice.status = "NEEDS_REVIEW"
+                db.commit()
+                await notify_user(invoice.telegram_user_id,
+                    "♾️ این سرویس نامحدود است؛ خرید حجم اضافه روی آن امکان‌پذیر نیست. "
+                    "لطفاً با پشتیبانی تماس بگیرید.")
+                return
+            user_id = invoice.telegram_user_id
+            added_gb = invoice.added_gb or 0
+            service_id = svc.id
+            panel_user_id, panel_username = svc.panel_user_id, svc.panel_username
+
+        amz = AmneziaClient()
+        try:
+            if not panel_user_id or not panel_username:
+                raise RuntimeError(f"service {service_id} has no dedicated panel account")
+            stats = await amz.get_user_stats(panel_username)
+            if stats is None:
+                raise RuntimeError(f"panel user {panel_username} not found")
+            current_limit_gb = round(stats['limit'] / (1024 ** 3))
+            new_limit_gb = current_limit_gb + added_gb
+            await amz.update_user_limits(panel_user_id, user_id,
+                                         quota_gb=new_limit_gb)
+            with SessionLocal() as db:
+                svc = db.query(AmneziaService).filter(AmneziaService.id == service_id).first()
+                if svc:
+                    svc.quota_bytes = new_limit_gb * 1024 ** 3
+                    svc.status = 'active'
+                invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
+                if invoice:
+                    invoice.status = "COMPLETE"
+                db.commit()
+            await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "✨✅✨"],
+                                          f"➕ <b>{added_gb} گیگابایت با موفقیت به سرویس Amnezia شما اضافه شد!</b> 🎉")
+            referral_notifications = mark_referral_paid(user_id)
+            notifications = referral_notifications + [
+                (user_id, f"➕ <b>{added_gb} گیگابایت به سرویس Amnezia شما اضافه شد!</b>")
+            ]
+            admin_ids = [int(x.strip()) for x in os.getenv('ADMIN_CHAT_IDS', '').split(',') if x.strip()]
+            for aid in admin_ids:
+                notifications.append((aid,
+                    f"✅ <b>خرید حجم Amnezia انجام شد</b> ({added_gb}GB) برای <code>{user_id}</code> | 📄 #{invoice_id}"))
+            await notify_many_users(notifications)
+        finally:
+            await amz.close()
+    except Exception as e:
+        await animate_loading_message(invoice_id, ["⏳", "⌛", "⏳", "❌😔"],
+                                      f"❌ <b>خطا در افزودن حجم Amnezia:</b> {str(e)[:200]}\n\n🙏 لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+        raise
+
 
 
 @celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
