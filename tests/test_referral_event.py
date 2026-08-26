@@ -29,3 +29,22 @@ def test_init_db_is_idempotent_on_paid_at():
     from sqlalchemy import inspect
     names = [c['name'] for c in inspect(database.engine).get_columns('referrals')]
     assert 'paid_at' in names
+
+
+def test_new_table_pks_autoincrement_on_sqlite():
+    from database import SessionLocal, ReferralEvent, ReferralEventReward
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        ev = ReferralEvent(title='t', required_invites=1, service_type='vless',
+                           starts_at=now, ends_at=now + timedelta(hours=1))
+        db.add(ev)
+        db.flush()
+        assert ev.id is not None
+        rw = ReferralEventReward(event_id=ev.id, referrer_id=1,
+                                 granted_at=now, service_type='vless')
+        db.add(rw)
+        db.flush()
+        assert rw.id is not None
+        db.delete(rw)
+        db.delete(ev)
+        db.commit()

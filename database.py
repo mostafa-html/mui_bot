@@ -117,7 +117,7 @@ class Referral(Base):
 
 class ReferralEvent(Base):
     __tablename__ = "referral_events"
-    id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    id = Column(Integer().with_variant(BigInteger(), "postgresql"), primary_key=True, index=True, autoincrement=True)
     title = Column(String, nullable=False, default="رویداد معرفی")
     required_invites = Column(Integer, nullable=False)
     service_type = Column(String, nullable=False)  # 'vless' | 'amnezia'
@@ -131,7 +131,7 @@ class ReferralEvent(Base):
 
 class ReferralEventReward(Base):
     __tablename__ = "referral_event_rewards"
-    id = Column(BigInteger, primary_key=True, index=True, autoincrement=True)
+    id = Column(Integer().with_variant(BigInteger(), "postgresql"), primary_key=True, index=True, autoincrement=True)
     event_id = Column(BigInteger, ForeignKey('referral_events.id'), nullable=False, index=True)
     referrer_id = Column(BigInteger, nullable=False, index=True)
     granted_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
