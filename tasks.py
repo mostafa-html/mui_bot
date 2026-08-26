@@ -427,9 +427,112 @@ def mark_referral_paid(user_id: int):
     return notifications
 
 
-@celery_app.task
-def provide_event_reward(user_id: int, event_id: int):  # TEMP — replaced in Task 3
-    raise NotImplementedError
+@celery_app.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def provide_event_reward(self, user_id: int, event_id: int):
+    """Free config earned via a referral event. VLESS → cloned from
+    provide_referral_reward; Amnezia → cloned from provision_amnezia_trial
+    MINUS the AmneziaTrial entitlement (is_trial=True ⇒ the daily sweep
+    deletes the whole panel account at expiry — spec D6)."""
+    import math
+
+    async def _run():
+        try:
+            with SessionLocal() as db:
+                event = db.query(ReferralEvent).filter(ReferralEvent.id == event_id).first()
+                if not event:
+                    return
+                plan = None
+                if event.service_type == 'vless':
+                    plan = db.query(Plan).filter(Plan.id == event.vless_plan_id).first()
+                    if not plan:
+                        logging.error(f"provide_event_reward: plan {event.vless_plan_id} missing for event {event_id}")
+                        return
+
+            if event.service_type == 'vless':
+                email = f"event_{user_id}_{int(time.time())}"
+                total_bytes = plan.traffic_gb * 1024 ** 3
+                expiry_ms = int((time.time() + (plan.duration_days * 86400)) * 1000)
+                xui = XUIClient()
+                inbounds = await xui.get_enabled_inbounds()
+                inbound_ids = [ib['id'] for ib in inbounds]
+                await xui.add_client(email, total_bytes, expiry_ms, inbound_ids)
+                await xui.assign_group(email, str(user_id))
+                await invalidate_cache(user_id)
+                with SessionLocal() as db:
+                    db.add(Invoice(
+                        telegram_user_id=user_id, plan_id=plan.id,
+                        total_price=0, original_price=0, discount_amount=0,
+                        client_name=email, action_type="EVENT_REWARD", status="COMPLETE"))
+                    db.commit()
+                await notify_user(user_id,
+                    f"🎉 <b>جایزه رویداد «{event.title}» فعال شد!</b>\n"
+                    f"پلن {plan.name} به سرویس‌های شما اضافه شد.")
+                return
+
+            # ----- Amnezia branch -----
+            gb = max(1, math.ceil(float(event.amnezia_gb)))
+            days = int(event.amnezia_days)
+            amz = AmneziaClient()
+            try:
+                acct = await amz.ensure_service_account(
+                    user_id, base_username=f"event{user_id}", invoice_id=None)
+                servers = await amz.list_servers()
+                alive = [s for s in servers if s.get('alive', True)]
+                server_id = (alive or servers)[0]['id']
+                conn_name = f"event_{user_id}_{int(time.time())}"
+                created = await amz.add_connection(acct['panel_user_id'], server_id, conn_name)
+                now = datetime.now(timezone.utc)
+                expiry = now + timedelta(days=days)
+                await amz.update_user_limits(acct['panel_user_id'], user_id,
+                                             quota_gb=gb, expiry=expiry)
+                with SessionLocal() as db:
+                    svc = AmneziaService(
+                        telegram_user_id=user_id,
+                        connection_id=created['connection_id'],
+                        client_id=created['client_id'],
+                        server_id=created['server_id'],
+                        server_name=created.get('server_name'),
+                        protocol=created.get('protocol') or amz.protocol,
+                        name=conn_name,
+                        quota_bytes=gb * 1024 ** 3,
+                        expiry_date=expiry,
+                        status='active',
+                        is_trial=True,          # sweep deletes at expiry (D6)
+                        panel_user_id=acct['panel_user_id'],
+                        panel_username=acct['username'],
+                        panel_password=acct['password'],
+                    )
+                    db.add(svc)
+                    db.flush()
+                    db.add(Invoice(
+                        telegram_user_id=user_id,
+                        total_price=0, original_price=0, discount_amount=0,
+                        client_name=conn_name, action_type='EVENT_REWARD',
+                        status='COMPLETE', amnezia_service_id=svc.id))
+                    db.commit()
+                    service_id = svc.id
+                cfg = await amz.get_connection_config(created['server_id'], created['client_id'])
+                vpn_link = cfg.get('vpn_link')
+                config_text = cfg.get('config') or ''
+                await notify_user(user_id,
+                    f"🎉 <b>جایزه رویداد «{event.title}» فعال شد!</b>\n\n"
+                    f"📦 حجم: {gb} GB\n⏳ مدت: {days} روز\n"
+                    f"⚠️ پس از انقضا، این سرویس به‌صورت خودکار حذف می‌شود.")
+                if vpn_link:
+                    await notify_user(user_id,
+                        f"🔗 <b>لینک اتصال:</b>\n<code>{vpn_link}</code>\n\n"
+                        f"👆 کپی و در برنامه Amnezia گزینه Import بزنید.")
+                if config_text:
+                    await send_user_document(user_id, f"{conn_name}.conf",
+                                             config_text.encode('utf-8'),
+                                             "📄 فایل کانفیگ جایزه رویداد")
+            finally:
+                await amz.close()
+        except Exception as e:
+            logging.error(f"provide_event_reward failed user={user_id} event={event_id}: {e}")
+            raise
+
+    run_async(_run())
 
 # ----- New tasks -----
 @celery_app.task

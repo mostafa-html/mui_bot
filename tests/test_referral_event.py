@@ -202,3 +202,156 @@ def test_get_active_event_boundaries():
     _seed_event(ev_id=11, start=now - timedelta(hours=49), hours=48)
     with SessionLocal() as db:
         assert get_active_event(db) is None
+
+
+def _swap_services_table():
+    """SQLite can't autoincrement BigInteger PKs — mirror test_amnezia_trial."""
+    from database import engine
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS amnezia_services"))
+        conn.execute(text("""
+            CREATE TABLE amnezia_services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_user_id BIGINT NOT NULL,
+                connection_id VARCHAR(64) NOT NULL,
+                client_id VARCHAR(255) NOT NULL,
+                server_id BIGINT NOT NULL,
+                server_name VARCHAR(100),
+                protocol VARCHAR(20) NOT NULL,
+                name VARCHAR(100) NOT NULL,
+                quota_bytes BIGINT NOT NULL,
+                expiry_date DATETIME NOT NULL,
+                status VARCHAR(20),
+                is_trial BOOLEAN DEFAULT 0 NOT NULL,
+                invoice_id BIGINT,
+                panel_user_id VARCHAR(64),
+                panel_username VARCHAR(100),
+                panel_password VARCHAR(128),
+                expiry_warned_at DATETIME,
+                server_missing_notified_at DATETIME,
+                created_at DATETIME,
+                updated_at DATETIME
+            )"""))
+
+
+class _PatchIO:
+    """Silence + record every outbound side effect of provide_event_reward."""
+    def __init__(self):
+        self.notified, self.docs, self.calls = [], [], {}
+
+    def __enter__(self):
+        import tasks
+        self._orig = {}
+        for name in ('invalidate_cache', 'notify_user', 'send_user_document'):
+            self._orig[name] = getattr(tasks, name)
+
+        async def _noop_cache(tg_id):
+            self.calls.setdefault('cache', []).append(tg_id)
+
+        async def _rec_notify(tg_id, text, *a, **k):
+            self.notified.append((tg_id, text))
+
+        async def _rec_doc(tg_id, filename, content, caption):
+            self.docs.append((tg_id, filename))
+
+        tasks.invalidate_cache = _noop_cache
+        tasks.notify_user = _rec_notify
+        tasks.send_user_document = _rec_doc
+        return self
+
+    def __exit__(self, *exc):
+        import tasks
+        for name, val in self._orig.items():
+            setattr(tasks, name, val)
+
+
+class _FakeXUI:
+    def __init__(self):
+        pass
+
+    async def get_enabled_inbounds(self):
+        return [{'id': 1}, {'id': 2}]
+
+    async def add_client(self, email, total_bytes, expiry_ms, inbound_ids):
+        self.email, self.bytes, self.inbounds = email, total_bytes, inbound_ids
+
+    async def assign_group(self, email, tg_id):
+        self.group = (email, tg_id)
+
+
+def test_vless_reward_provisions_from_bound_plan():
+    _clean_referral_tables()
+    from tests._bootstrap import seed_plan
+    seed_plan(5, name='Evt 8GB', gb=8, days=25, price=1, service_type='xui')
+    _seed_event(ev_id=3, service='vless', plan_id=5)
+    import tasks
+    fake = _FakeXUI()
+    orig_xui = tasks.XUIClient
+    tasks.XUIClient = lambda: fake
+    try:
+        with _PatchIO() as io:
+            tasks.provide_event_reward.run(7001, 3)      # eager, no broker
+    finally:
+        tasks.XUIClient = orig_xui
+    from database import SessionLocal, Invoice
+    with SessionLocal() as db:
+        inv = db.query(Invoice).filter(
+            Invoice.action_type == 'EVENT_REWARD').order_by(Invoice.id.desc()).first()
+        assert inv is not None
+        assert inv.total_price == 0 and inv.plan_id == 5 and inv.telegram_user_id == 7001
+    assert fake.email.startswith('event_7001_')
+    assert fake.bytes == 8 * 1024 ** 3 and sorted(fake.inbounds) == [1, 2]
+    assert any('رویداد' in t for _, t in io.notified)
+
+
+def test_amnezia_reward_flags_trial_without_entitlement():
+    _swap_services_table()
+    _clean_referral_tables()
+    _seed_event(ev_id=4, service='amnezia')
+    import tasks
+
+    class _FakeAmz:
+        protocol = 'awg2'
+
+        async def ensure_service_account(self, user_id, base_username, invoice_id):
+            return {'panel_user_id': f'pu{user_id}', 'username': base_username,
+                    'password': 'pw'}
+
+        async def list_servers(self):
+            return [{'id': 77, 'alive': False}, {'id': 88, 'alive': True}]
+
+        async def add_connection(self, panel_user_id, server_id, name):
+            return {'connection_id': 'c1', 'client_id': 'cl1', 'server_id': server_id,
+                    'server_name': 'srv88', 'protocol': 'awg2'}
+
+        async def update_user_limits(self, panel_user_id, user_id, quota_gb, expiry):
+            self.quota_gb, self.expiry = quota_gb, expiry
+
+        async def get_connection_config(self, server_id, client_id):
+            return {'vpn_link': 'vless://fake', 'config': 'CONFTEXT'}
+
+        async def close(self):
+            pass
+
+    fake = _FakeAmz()
+    orig_amz = tasks.AmneziaClient
+    tasks.AmneziaClient = lambda: fake
+    try:
+        with _PatchIO() as io:
+            tasks.provide_event_reward.run(8001, 4)
+    finally:
+        tasks.AmneziaClient = orig_amz
+
+    from database import SessionLocal, AmneziaService, AmneziaTrial, Invoice
+    with SessionLocal() as db:
+        svc = db.query(AmneziaService).order_by(AmneziaService.id.desc()).first()
+        assert svc is not None and svc.is_trial is True and svc.server_id == 88
+        assert svc.quota_bytes == 5 * 1024 ** 3          # ceil(5)=5 whole GB
+        assert db.query(AmneziaTrial).filter(               # entitlement untouched
+            AmneziaTrial.telegram_user_id == 8001).first() is None
+        inv = db.query(Invoice).filter(
+            Invoice.amnezia_service_id == svc.id).first()
+        assert inv is not None and inv.action_type == 'EVENT_REWARD'
+    assert fake.quota_gb == 5
+    assert any(f[1].endswith('.conf') for f in io.docs)
